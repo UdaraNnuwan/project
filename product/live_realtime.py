@@ -1,10 +1,9 @@
-import logging
 import os
 import sys
 import time
-from collections import deque
+import logging
+from collections import deque, defaultdict
 from datetime import datetime, timezone
-from functools import reduce
 
 import joblib
 import numpy as np
@@ -13,43 +12,55 @@ import requests
 import torch
 
 # =========================================================
-# PATH SETUP
+# PATHS / IMPORTS
 # =========================================================
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 sys.path.append(PROJECT_ROOT)
 
-from src.model import FiLMAutoencoder  # noqa: E402
+from src.model import FiLMAutoencoder  # adjust only if needed
 
 # =========================================================
-# CONFIGURATION
+# CONFIG
 # =========================================================
 PROM_URL = "http://35.206.92.147:9090/api/v1/query"
-LOG_PATH = os.path.join(CURRENT_DIR, "result.log")
-RAW_DATA_LOG_PATH = os.path.join(CURRENT_DIR, "raw_snapshots.csv")
 
 MODEL_DIR = os.path.join(PROJECT_ROOT, "saved_model")
 MODEL_PATH = os.path.join(MODEL_DIR, "ae_model.pt")
 X_SCALER_PATH = os.path.join(MODEL_DIR, "scaler.joblib")
 C_SCALER_PATH = os.path.join(MODEL_DIR, "ctx_scaler.joblib")
 DETECTOR_META_PATH = os.path.join(MODEL_DIR, "detector_meta.joblib")
+AE_META_PATH = os.path.join(MODEL_DIR, "ae_model_meta.joblib")
+
+RAW_SNAPSHOT_CSV = os.path.join(CURRENT_DIR, "raw_snapshots.csv")
+LOG_FILE = os.path.join(CURRENT_DIR, "result.log")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Poll interval
-COLLECT_INTERVAL_SECONDS = 5
-STALENESS_THRESHOLD_SECONDS = 10
-ALERT_COOLDOWN_SECONDS = 10
-ENABLE_DYNAMIC_THRESHOLD = True
-THRESHOLD_HISTORY_SIZE = 120
-MIN_HISTORY_FOR_DYNAMIC_THRESHOLD = 20
-DYNAMIC_THRESHOLD_STD_MULTIPLIER = 3.0
-
-# Target selector
+# ---------------------------------------------------------
+# TARGET FILTERS
+# ---------------------------------------------------------
 TARGET_NAMESPACE = "default"
-TARGET_POD = "chcekone"      # pod name contains this text
-TARGET_CONTAINER = None
+TARGET_POD = "chcekone-8464c69d8f-mnr5t"   # exact pod name
+TARGET_CONTAINER = "nginx"
 
+# ---------------------------------------------------------
+# LOOP SETTINGS
+# ---------------------------------------------------------
+POLL_INTERVAL_SECONDS = 30
+WINDOW_SIZE_FALLBACK = 24
+
+# false positive reduction
+WARMUP_WINDOWS = 20
+ANOMALY_CONSECUTIVE_HITS = 3
+CLEAR_CONSECUTIVE_NORMALS = 3
+SCORE_HISTORY_SIZE = 100
+DYNAMIC_THRESHOLD_STD_MULTIPLIER = 4.0
+MIN_THRESHOLD_FACTOR = 1.0
+
+# ---------------------------------------------------------
+# LIVE FEATURES (must match training count/order)
+# ---------------------------------------------------------
 FEATURE_COLS = [
     "cpu_util",
     "mem_util",
@@ -61,449 +72,577 @@ FEATURE_COLS = [
     "mem_cache",
 ]
 
-FINAL_COLUMNS = [
-    "timestamp",
-    "namespace",
-    "pod",
-    "container",
-    "cpu_util",
-    "mem_util",
-    "net_in",
-    "net_out",
-    "disk_read",
-    "disk_write",
-    "mem_rss",
-    "mem_cache",
-]
+# =========================================================
+# LOGGING
+# =========================================================
+LOGGER = logging.getLogger("live_realtime")
+LOGGER.setLevel(logging.INFO)
+LOGGER.handlers.clear()
 
-SKIP_ALL_ZERO_ROWS = True
+formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+fh.setLevel(logging.INFO)
+fh.setFormatter(formatter)
+LOGGER.addHandler(fh)
+
+sh = logging.StreamHandler()
+sh.setLevel(logging.INFO)
+sh.setFormatter(formatter)
+LOGGER.addHandler(sh)
 
 # =========================================================
 # PROMETHEUS QUERIES
 # =========================================================
 QUERIES = {
     "cpu_util": """
-        sum by (container_label_io_kubernetes_pod_namespace, container_label_io_kubernetes_pod_name, container_label_io_kubernetes_container_name)
-        (rate(container_cpu_usage_seconds_total{image!="", container_label_io_kubernetes_container_name!=""}[5m]))
+        sum by (
+            container_label_io_kubernetes_pod_namespace,
+            container_label_io_kubernetes_pod_name,
+            container_label_io_kubernetes_container_name
+        ) (
+            rate(container_cpu_usage_seconds_total{
+                job="cadvisor",
+                image!="",
+                container_label_io_kubernetes_pod_name!="",
+                container_label_io_kubernetes_container_name!=""
+            }[5m])
+        )
     """,
     "mem_util": """
-        sum by (container_label_io_kubernetes_pod_namespace, container_label_io_kubernetes_pod_name, container_label_io_kubernetes_container_name)
-        (container_memory_working_set_bytes{image!="", container_label_io_kubernetes_container_name!=""})
+        sum by (
+            container_label_io_kubernetes_pod_namespace,
+            container_label_io_kubernetes_pod_name,
+            container_label_io_kubernetes_container_name
+        ) (
+            container_memory_working_set_bytes{
+                job="cadvisor",
+                image!="",
+                container_label_io_kubernetes_pod_name!="",
+                container_label_io_kubernetes_container_name!=""
+            }
+        )
     """,
     "net_in": """
-        sum by (container_label_io_kubernetes_pod_namespace, container_label_io_kubernetes_pod_name)
-        (rate(container_network_receive_bytes_total{image!="", interface="eth0"}[5m]))
+        sum by (
+            container_label_io_kubernetes_pod_namespace,
+            container_label_io_kubernetes_pod_name
+        ) (
+            rate(container_network_receive_bytes_total{
+                job="cadvisor",
+                interface="eth0",
+                container_label_io_kubernetes_pod_name!=""
+            }[5m])
+        )
     """,
     "net_out": """
-        sum by (container_label_io_kubernetes_pod_namespace, container_label_io_kubernetes_pod_name)
-        (rate(container_network_transmit_bytes_total{image!="", interface="eth0"}[5m]))
+        sum by (
+            container_label_io_kubernetes_pod_namespace,
+            container_label_io_kubernetes_pod_name
+        ) (
+            rate(container_network_transmit_bytes_total{
+                job="cadvisor",
+                interface="eth0",
+                container_label_io_kubernetes_pod_name!=""
+            }[5m])
+        )
     """,
     "disk_read": """
-        sum by (container_label_io_kubernetes_pod_namespace, container_label_io_kubernetes_pod_name, container_label_io_kubernetes_container_name)
-        (rate(container_fs_reads_bytes_total{image!="", container_label_io_kubernetes_container_name!=""}[5m]))
+        sum by (
+            container_label_io_kubernetes_pod_namespace,
+            container_label_io_kubernetes_pod_name,
+            container_label_io_kubernetes_container_name
+        ) (
+            rate(container_fs_reads_bytes_total{
+                job="cadvisor",
+                image!="",
+                container_label_io_kubernetes_pod_name!="",
+                container_label_io_kubernetes_container_name!=""
+            }[5m])
+        )
     """,
     "disk_write": """
-        sum by (container_label_io_kubernetes_pod_namespace, container_label_io_kubernetes_pod_name, container_label_io_kubernetes_container_name)
-        (rate(container_fs_writes_bytes_total{image!="", container_label_io_kubernetes_container_name!=""}[5m]))
+        sum by (
+            container_label_io_kubernetes_pod_namespace,
+            container_label_io_kubernetes_pod_name,
+            container_label_io_kubernetes_container_name
+        ) (
+            rate(container_fs_writes_bytes_total{
+                job="cadvisor",
+                image!="",
+                container_label_io_kubernetes_pod_name!="",
+                container_label_io_kubernetes_container_name!=""
+            }[5m])
+        )
     """,
     "mem_rss": """
-        sum by (container_label_io_kubernetes_pod_namespace, container_label_io_kubernetes_pod_name, container_label_io_kubernetes_container_name)
-        (container_memory_rss{image!="", container_label_io_kubernetes_container_name!=""})
+        sum by (
+            container_label_io_kubernetes_pod_namespace,
+            container_label_io_kubernetes_pod_name,
+            container_label_io_kubernetes_container_name
+        ) (
+            container_memory_rss{
+                job="cadvisor",
+                image!="",
+                container_label_io_kubernetes_pod_name!="",
+                container_label_io_kubernetes_container_name!=""
+            }
+        )
     """,
     "mem_cache": """
-        sum by (container_label_io_kubernetes_pod_namespace, container_label_io_kubernetes_pod_name, container_label_io_kubernetes_container_name)
-        (container_memory_cache{image!="", container_label_io_kubernetes_container_name!=""})
+        sum by (
+            container_label_io_kubernetes_pod_namespace,
+            container_label_io_kubernetes_pod_name,
+            container_label_io_kubernetes_container_name
+        ) (
+            container_memory_cache{
+                job="cadvisor",
+                image!="",
+                container_label_io_kubernetes_pod_name!="",
+                container_label_io_kubernetes_container_name!=""
+            }
+        )
     """,
 }
 
 # =========================================================
-# LOGGING
+# HELPERS
 # =========================================================
-def setup_logger():
-    logger = logging.getLogger("realtime_film_monitor")
-    if logger.handlers:
-        return logger
-
-    logger.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s %(message)s")
-
-    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-
-    logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
-    logger.propagate = False
-    return logger
+def safe_load_joblib(path, default=None):
+    if os.path.exists(path):
+        return joblib.load(path)
+    return default
 
 
-LOGGER = setup_logger()
-
-# =========================================================
-# MODEL / SCALER LOAD
-# =========================================================
-def load_assets():
-    LOGGER.info("[INFO] Loading model, scalers, and metadata...")
-
-    x_scaler = joblib.load(X_SCALER_PATH)
-    c_scaler = joblib.load(C_SCALER_PATH)
-    det_meta = joblib.load(DETECTOR_META_PATH)
-
-    threshold = det_meta["threshold"]
-    window_size = det_meta["window_size"]
-
-    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
-
-    model = FiLMAutoencoder(
-        window_size=window_size,
-        n_features=len(FEATURE_COLS),
-        context_dim=c_scaler.n_features_in_,
-    ).to(DEVICE)
-
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
-    else:
-        model.load_state_dict(checkpoint)
-
-    model.eval()
-    return x_scaler, c_scaler, threshold, window_size, model
-
-# =========================================================
-# PROMETHEUS COLLECTION
-# =========================================================
 def query_prometheus(query: str):
     try:
         response = requests.get(PROM_URL, params={"query": query}, timeout=20)
         response.raise_for_status()
         payload = response.json()
-
         if payload.get("status") != "success":
             return []
-
         return payload["data"]["result"]
     except Exception as e:
-        LOGGER.error(f"[ERROR] Query failed: {e}")
+        LOGGER.error(f"Prometheus query failed: {e}")
         return []
 
 
-def normalize_labels(metric: dict) -> dict:
+def normalize_metric_labels(metric: dict):
+    namespace = (
+        metric.get("namespace")
+        or metric.get("container_label_io_kubernetes_pod_namespace")
+        or ""
+    )
+    pod = (
+        metric.get("pod")
+        or metric.get("container_label_io_kubernetes_pod_name")
+        or ""
+    )
+    container = (
+        metric.get("container")
+        or metric.get("container_label_io_kubernetes_container_name")
+        or ""
+    )
+
     return {
-        "namespace": metric.get("container_label_io_kubernetes_pod_namespace", ""),
-        "pod": metric.get("container_label_io_kubernetes_pod_name", ""),
-        "container": metric.get("container_label_io_kubernetes_container_name", ""),
+        "namespace": namespace,
+        "pod": pod,
+        "container": container,
     }
 
 
-def collect_all_metrics_once() -> pd.DataFrame:
+def result_to_df(results, metric_name: str) -> pd.DataFrame:
+    rows = []
+
+    for item in results:
+        metric = item.get("metric", {})
+        value = item.get("value", [None, None])
+
+        labels = normalize_metric_labels(metric)
+
+        if metric_name in ("net_in", "net_out") and not labels["container"]:
+            labels["container"] = "__pod__"
+
+        rows.append({
+            "namespace": labels["namespace"],
+            "pod": labels["pod"],
+            "container": labels["container"],
+            metric_name: float(value[1]) if value[1] is not None else 0.0
+        })
+
+    return pd.DataFrame(rows)
+
+
+def expand_pod_level_network_to_containers(df_metric: pd.DataFrame, container_index: pd.DataFrame) -> pd.DataFrame:
+    if df_metric.empty:
+        return df_metric
+
+    pod_level = df_metric[df_metric["container"] == "__pod__"].copy()
+    normal = df_metric[df_metric["container"] != "__pod__"].copy()
+
+    if pod_level.empty:
+        return df_metric
+
+    if container_index.empty:
+        return normal
+
+    expanded = pod_level.merge(
+        container_index[["namespace", "pod", "container"]].drop_duplicates(),
+        on=["namespace", "pod"],
+        how="left",
+        suffixes=("", "_real")
+    )
+    expanded["container"] = expanded["container_real"].fillna("__pod__")
+    expanded = expanded.drop(columns=["container_real"])
+
+    return pd.concat([normal, expanded], ignore_index=True)
+
+
+def collect_snapshot() -> pd.DataFrame:
     metric_dfs = {}
 
-    for name, query in QUERIES.items():
+    for metric_name, query in QUERIES.items():
         results = query_prometheus(query)
-        rows = []
+        metric_dfs[metric_name] = result_to_df(results, metric_name)
 
-        for item in results:
-            labels = normalize_labels(item["metric"])
+    container_index_parts = []
+    for key in ["cpu_util", "mem_util", "disk_read", "disk_write", "mem_rss", "mem_cache"]:
+        df = metric_dfs.get(key, pd.DataFrame())
+        if not df.empty:
+            container_index_parts.append(df[["namespace", "pod", "container"]])
 
-            # Network metrics have no container label in some cases
-            if name in ["net_in", "net_out"] and not labels["container"]:
-                labels["container"] = "__pod__"
-
-            rows.append({
-                "namespace": labels["namespace"],
-                "pod": labels["pod"],
-                "container": labels["container"],
-                name: float(item["value"][1]),
-            })
-
-        metric_dfs[name] = pd.DataFrame(rows)
-
-    # Build container index from non-network metrics
-    container_parts = [
-        df for key, df in metric_dfs.items()
-        if key not in ["net_in", "net_out"] and not df.empty
-    ]
-
-    if container_parts:
-        container_index = (
-            pd.concat(container_parts, ignore_index=True)[["namespace", "pod", "container"]]
-            .drop_duplicates()
-        )
+    if container_index_parts:
+        container_index = pd.concat(container_index_parts, ignore_index=True).drop_duplicates()
     else:
         container_index = pd.DataFrame(columns=["namespace", "pod", "container"])
 
-    # Spread pod-level network metrics to container level
-    for net_key in ["net_in", "net_out"]:
-        df = metric_dfs[net_key]
-        if not df.empty and not container_index.empty:
-            pod_level = df[df["container"] == "__pod__"]
-            if not pod_level.empty:
-                merged = pod_level.merge(
-                    container_index,
-                    on=["namespace", "pod"],
-                    suffixes=("_old", "")
-                )
-                metric_dfs[net_key] = merged[["namespace", "pod", "container", net_key]]
+    for key in ["net_in", "net_out"]:
+        metric_dfs[key] = expand_pod_level_network_to_containers(metric_dfs[key], container_index)
 
     dfs = [df for df in metric_dfs.values() if not df.empty]
     if not dfs:
-        return pd.DataFrame(columns=FINAL_COLUMNS)
+        return pd.DataFrame()
 
-    final_df = reduce(
-        lambda left, right: pd.merge(
-            left, right, on=["namespace", "pod", "container"], how="outer"
-        ),
-        dfs
-    )
-
-    final_df = final_df.fillna(0.0)
-    final_df["timestamp"] = datetime.now(timezone.utc).isoformat()
-
-    for col in FINAL_COLUMNS:
-        if col not in final_df.columns:
-            if col in ["timestamp", "namespace", "pod", "container"]:
-                final_df[col] = ""
-            else:
-                final_df[col] = 0.0
-
-    final_df = final_df[FINAL_COLUMNS]
-
-    if SKIP_ALL_ZERO_ROWS:
-        final_df = final_df[final_df[FEATURE_COLS].sum(axis=1) > 0]
-
-    return final_df
-
-# =========================================================
-# INFERENCE HELPERS
-# =========================================================
-def compute_anomaly_score(x_window, x_scaler, c_scaler, model):
-    x_raw = np.asarray(x_window, dtype=np.float32)
-    x_log = np.log1p(np.clip(x_raw, a_min=0, a_max=None))
-    x_scaled = x_scaler.transform(x_log)
-
-    x_tensor = torch.FloatTensor(x_scaled).unsqueeze(0).to(DEVICE)
-    c_scaled = np.zeros((1, c_scaler.n_features_in_), dtype=np.float32)
-    c_tensor = torch.FloatTensor(c_scaled).to(DEVICE)
-
-    with torch.no_grad():
-        reconstructed = model(x_tensor, c_tensor)
-
-    x_pred_scaled = reconstructed.cpu().numpy().squeeze()
-
-    errors = (x_scaled - x_pred_scaled) ** 2
-    mse_per_feature = np.mean(errors, axis=0)
-    total_score = float(np.mean(mse_per_feature))
-
-    return total_score, mse_per_feature
-
-
-def compute_dynamic_threshold(score_history, static_threshold):
-    if not ENABLE_DYNAMIC_THRESHOLD or len(score_history) < MIN_HISTORY_FOR_DYNAMIC_THRESHOLD:
-        return float(static_threshold)
-
-    history = np.asarray(score_history, dtype=np.float32)
-    adaptive_threshold = float(
-        np.mean(history) + DYNAMIC_THRESHOLD_STD_MULTIPLIER * np.std(history)
-    )
-    return max(float(static_threshold), adaptive_threshold)
-
-
-def append_raw_snapshots(raw_df):
-    raw_df = raw_df[FINAL_COLUMNS].copy()
-    raw_df.to_csv(
-        RAW_DATA_LOG_PATH,
-        mode="a",
-        header=not os.path.exists(RAW_DATA_LOG_PATH),
-        index=False,
-    )
-
-
-def init_container_state(window_size):
-    return {
-        "window_buffer": deque(maxlen=window_size),
-        "score_history": deque(maxlen=THRESHOLD_HISTORY_SIZE),
-        "last_processed_timestamp": None,
-        "last_alert_time": 0.0,
-        "anomaly_active": False,
-    }
-
-
-def print_top_metrics(mse_per_feature, latest_row):
-    LOGGER.info("-" * 50)
-    LOGGER.info("REASON (TOP CONTRIBUTING METRICS):")
-
-    top_indices = np.argsort(mse_per_feature)[::-1][:3]
-    for idx in top_indices:
-        f_name = FEATURE_COLS[idx]
-        f_error = mse_per_feature[idx]
-        actual_val = latest_row[f_name]
-        LOGGER.info(
-            f" -> {f_name.upper()}: Error={f_error:.6f} "
-            f"(Actual Val={actual_val:.2f})"
+    merged = dfs[0]
+    for df in dfs[1:]:
+        merged = pd.merge(
+            merged,
+            df,
+            on=["namespace", "pod", "container"],
+            how="outer"
         )
 
+    merged = merged.fillna(0.0)
 
-def is_stale(ts_str: str, threshold_seconds: int) -> bool:
-    try:
-        ts = pd.to_datetime(ts_str, utc=True)
-        now = datetime.now(timezone.utc)
-        age = (now - ts.to_pydatetime()).total_seconds()
-        return age > threshold_seconds
-    except Exception:
-        return False
+    now = datetime.now(timezone.utc).isoformat()
+    merged["timestamp"] = now
+
+    final_cols = ["timestamp", "namespace", "pod", "container"] + FEATURE_COLS
+    for c in final_cols:
+        if c not in merged.columns:
+            merged[c] = 0.0 if c not in ("timestamp", "namespace", "pod", "container") else ""
+
+    merged = merged[final_cols]
+
+    if TARGET_NAMESPACE:
+        merged = merged[merged["namespace"] == TARGET_NAMESPACE]
+    if TARGET_POD:
+        merged = merged[merged["pod"] == TARGET_POD]
+    if TARGET_CONTAINER:
+        merged = merged[merged["container"] == TARGET_CONTAINER]
+
+    merged = merged[(merged[FEATURE_COLS].sum(axis=1) > 0)]
+
+    return merged.sort_values(["namespace", "pod", "container"]).reset_index(drop=True)
+
+
+def append_raw_snapshot(df: pd.DataFrame):
+    if df.empty:
+        return
+    exists = os.path.exists(RAW_SNAPSHOT_CSV)
+    df.to_csv(RAW_SNAPSHOT_CSV, mode="a", header=not exists, index=False)
+
+
+def extract_threshold(detector_meta) -> float:
+    if isinstance(detector_meta, dict):
+        for key in ["threshold", "thresh", "best_threshold", "anomaly_threshold"]:
+            if key in detector_meta:
+                return float(detector_meta[key])
+    return 1.0
+
+
+def extract_window_size(ae_meta, detector_meta) -> int:
+    for meta in [ae_meta, detector_meta]:
+        if isinstance(meta, dict):
+            for key in ["window_size", "seq_len", "sequence_length", "lookback"]:
+                if key in meta:
+                    return int(meta[key])
+    return WINDOW_SIZE_FALLBACK
+
+
+def build_label_maps(seen_keys):
+    namespaces = sorted(list({k[0] for k in seen_keys}))
+    containers = sorted(list({k[2] for k in seen_keys}))
+
+    ns_map = {v: i for i, v in enumerate(namespaces)}
+    ct_map = {v: i for i, v in enumerate(containers)}
+    return ns_map, ct_map
+
+
+def build_context_vector(namespace, container, ns_map, ct_map, c_dim):
+    base = [
+        float(ns_map.get(namespace, -1)),
+        float(ct_map.get(container, -1)),
+    ]
+    vec = np.array(base, dtype=np.float32)
+
+    if len(vec) < c_dim:
+        vec = np.pad(vec, (0, c_dim - len(vec)), mode="constant", constant_values=0.0)
+    elif len(vec) > c_dim:
+        vec = vec[:c_dim]
+
+    return vec.reshape(1, -1)
+
+
+def infer_context_dim(c_scaler):
+    if hasattr(c_scaler, "n_features_in_"):
+        return int(c_scaler.n_features_in_)
+    return 2
+
+
+def build_model(ae_meta, x_dim, c_dim):
+    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+        window_size = int(checkpoint.get("window_size", extract_window_size(ae_meta, {})))
+        n_features = int(checkpoint.get("n_features", x_dim))
+        context_dim = int(checkpoint.get("context_dim", c_dim))
+        units = int(checkpoint.get("units", 64))
+        latent = int(checkpoint.get("latent", 16))
+    else:
+        state_dict = checkpoint
+        window_size = extract_window_size(ae_meta, {})
+        n_features = x_dim
+        context_dim = c_dim
+        units = 64
+        latent = 16
+
+    LOGGER.info(
+        f"Checkpoint params | window_size={window_size}, "
+        f"n_features={n_features}, context_dim={context_dim}, "
+        f"units={units}, latent={latent}"
+    )
+
+    model = FiLMAutoencoder(
+        window_size=window_size,
+        n_features=n_features,
+        context_dim=context_dim,
+        units=units,
+        latent=latent,
+    )
+
+    model.load_state_dict(state_dict)
+    model.to(DEVICE)
+    model.eval()
+    return model
+
+
+def compute_anomaly_score(model, x_scaler, c_scaler, window_rows, ns_map, ct_map):
+    x = window_rows[FEATURE_COLS].values.astype(np.float32)
+    x_scaled = x_scaler.transform(x)
+
+    namespace = str(window_rows["namespace"].iloc[-1])
+    container = str(window_rows["container"].iloc[-1])
+
+    c_dim = infer_context_dim(c_scaler)
+    c_raw = build_context_vector(namespace, container, ns_map, ct_map, c_dim)
+    c_scaled = c_scaler.transform(c_raw)
+
+    x_tensor = torch.tensor(x_scaled, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+    c_tensor = torch.tensor(c_scaled, dtype=torch.float32).to(DEVICE)
+
+    with torch.no_grad():
+        x_hat = model(x_tensor, c_tensor)
+
+    x_true_scaled = x_tensor.squeeze(0).cpu().numpy()
+    x_pred_scaled = x_hat.squeeze(0).cpu().numpy()
+
+    sq_err = (x_true_scaled - x_pred_scaled) ** 2
+    total_score = float(np.mean(sq_err))
+    per_feature = sq_err.mean(axis=0)
+
+    feature_error_map = {
+        FEATURE_COLS[i]: float(per_feature[i])
+        for i in range(len(FEATURE_COLS))
+    }
+
+    return total_score, feature_error_map
+
+
+def top_reason(feature_error_map):
+    ranked = sorted(feature_error_map.items(), key=lambda kv: kv[1], reverse=True)
+    top_features = [k for k, _ in ranked[:3]]
+
+    if "mem_util" in top_features or "mem_rss" in top_features or "mem_cache" in top_features:
+        reason = "abnormal memory behavior detected"
+    elif "cpu_util" in top_features:
+        reason = "abnormal CPU behavior detected"
+    elif "net_in" in top_features or "net_out" in top_features:
+        reason = "abnormal network behavior detected"
+    elif "disk_read" in top_features or "disk_write" in top_features:
+        reason = "abnormal disk I/O behavior detected"
+    else:
+        reason = "abnormal multivariate behavior detected"
+
+    return ranked, top_features, reason
+
+
+def init_container_state():
+    return {
+        "window_buffer": deque(),
+        "score_history": deque(maxlen=SCORE_HISTORY_SIZE),
+        "inference_count": 0,
+        "anomaly_active": False,
+        "anomaly_hits": 0,
+        "normal_hits": 0,
+    }
+
 
 # =========================================================
 # MAIN
 # =========================================================
 def main():
-    x_scaler, c_scaler, static_threshold, window_size, model = load_assets()
+    LOGGER.info("Loading model artifacts...")
 
-    LOGGER.info("")
-    LOGGER.info("[INFO] Starting unified real-time monitor...")
-    LOGGER.info(f"[INFO] Target namespace : {TARGET_NAMESPACE}")
-    LOGGER.info(f"[INFO] Target pod match : {TARGET_POD}")
-    LOGGER.info(f"[INFO] Target container : {TARGET_CONTAINER or 'ALL'}")
-    LOGGER.info(f"[INFO] Window size      : {window_size}")
-    LOGGER.info(f"[INFO] Static threshold : {static_threshold:.6f}")
-    LOGGER.info(f"[INFO] Dynamic threshold: {'ON' if ENABLE_DYNAMIC_THRESHOLD else 'OFF'}")
-    LOGGER.info(f"[INFO] Raw data file    : {RAW_DATA_LOG_PATH}")
-    LOGGER.info("")
+    ae_meta = safe_load_joblib(AE_META_PATH, default={})
+    detector_meta = safe_load_joblib(DETECTOR_META_PATH, default={})
+    x_scaler = joblib.load(X_SCALER_PATH)
+    c_scaler = joblib.load(C_SCALER_PATH)
 
-    container_states = {}
+    base_threshold = extract_threshold(detector_meta)
+    window_size = extract_window_size(ae_meta, detector_meta)
+    c_dim = infer_context_dim(c_scaler)
+
+    LOGGER.info(f"Base threshold: {base_threshold}")
+    LOGGER.info(f"Window size   : {window_size}")
+    LOGGER.info(f"Context dim   : {c_dim}")
+
+    model = build_model(ae_meta, len(FEATURE_COLS), c_dim)
+
+    states = defaultdict(init_container_state)
+    seen_keys = set()
+
+    LOGGER.info("Starting live anomaly detection loop...")
 
     while True:
         try:
-            df = collect_all_metrics_once()
+            snapshot = collect_snapshot()
 
-            if df.empty:
-                LOGGER.warning("[WARN] No data returned from Prometheus.")
-                time.sleep(COLLECT_INTERVAL_SECONDS)
+            if snapshot.empty:
+                LOGGER.info("No matching rows from Prometheus for target filter.")
+                time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
-            mask = (
-                (df["namespace"] == TARGET_NAMESPACE)
-                & (df["pod"].astype(str).str.contains(TARGET_POD, na=False))
-            )
-            target_df = df[mask].copy()
+            append_raw_snapshot(snapshot)
 
-            if TARGET_CONTAINER:
-                target_df = target_df[target_df["container"] == TARGET_CONTAINER].copy()
+            for _, row in snapshot.iterrows():
+                key = (row["namespace"], row["pod"], row["container"])
+                seen_keys.add(key)
 
-            if target_df.empty:
-                LOGGER.warning("[WARN] Target pod/container not found in current snapshot.")
-                time.sleep(COLLECT_INTERVAL_SECONDS)
-                continue
+                state = states[key]
+                state["window_buffer"].append(row.to_dict())
 
-            processed_rows = []
-
-            for _, latest_row in target_df.sort_values(["pod", "container"]).iterrows():
-                container_key = (
-                    latest_row["namespace"],
-                    latest_row["pod"],
-                    latest_row["container"],
-                )
-                state = container_states.setdefault(
-                    container_key,
-                    init_container_state(window_size),
-                )
-                latest_ts = latest_row["timestamp"]
-
-                if latest_ts == state["last_processed_timestamp"]:
-                    continue
-
-                state["last_processed_timestamp"] = latest_ts
-
-                if is_stale(latest_ts, STALENESS_THRESHOLD_SECONDS):
-                    LOGGER.warning(
-                        f"[WARN] Data is stale | pod={latest_row['pod']} | "
-                        f"container={latest_row['container']} | timestamp={latest_ts}"
-                    )
-                    continue
-
-                feature_values = latest_row[FEATURE_COLS].astype(float).values
-                state["window_buffer"].append(feature_values)
-                processed_rows.append(latest_row[FINAL_COLUMNS].to_dict())
-
-                LOGGER.info(
-                    f"[INFO] Snapshot received | pod={latest_row['pod']} | "
-                    f"container={latest_row['container']} | "
-                    f"buffer={len(state['window_buffer'])}/{window_size}"
-                )
+                if len(state["window_buffer"]) > window_size:
+                    state["window_buffer"].popleft()
 
                 if len(state["window_buffer"]) < window_size:
-                    LOGGER.info(
-                        f"[INFO] Waiting for enough data to fill the window for "
-                        f"container={latest_row['container']}..."
-                    )
                     continue
 
-                total_score, mse_per_feature = compute_anomaly_score(
-                    x_window=np.array(state["window_buffer"]),
+                ns_map, ct_map = build_label_maps(seen_keys)
+                window_df = pd.DataFrame(list(state["window_buffer"]))
+
+                total_score, feature_error_map = compute_anomaly_score(
+                    model=model,
                     x_scaler=x_scaler,
                     c_scaler=c_scaler,
-                    model=model,
-                )
-                active_threshold = compute_dynamic_threshold(
-                    state["score_history"],
-                    static_threshold,
+                    window_rows=window_df,
+                    ns_map=ns_map,
+                    ct_map=ct_map
                 )
 
-                LOGGER.info("")
+                state["score_history"].append(total_score)
+                state["inference_count"] += 1
+
+                if state["inference_count"] <= WARMUP_WINDOWS:
+                    hist = np.array(state["score_history"], dtype=np.float32)
+                    dyn_thr = max(
+                        base_threshold * MIN_THRESHOLD_FACTOR,
+                        float(hist.mean() + DYNAMIC_THRESHOLD_STD_MULTIPLIER * hist.std()) if len(hist) > 1 else base_threshold
+                    )
+
+                    LOGGER.info("=" * 60)
+                    LOGGER.info(f"TARGET    : {key}")
+                    LOGGER.info(f"STATUS    : WARMUP ({state['inference_count']}/{WARMUP_WINDOWS})")
+                    LOGGER.info(f"SCORE     : {total_score:.6f}")
+                    LOGGER.info(f"THRESHOLD : {dyn_thr:.6f}")
+                    LOGGER.info("=" * 60)
+                    continue
+
+                hist = np.array(state["score_history"], dtype=np.float32)
+
+                dynamic_threshold = base_threshold
+                if len(hist) > 5:
+                    dynamic_threshold = max(
+                        base_threshold * MIN_THRESHOLD_FACTOR,
+                        float(hist.mean() + DYNAMIC_THRESHOLD_STD_MULTIPLIER * hist.std())
+                    )
+
+                ranked, top_features, reason = top_reason(feature_error_map)
+                is_anomaly_now = total_score > dynamic_threshold
+
+                if is_anomaly_now:
+                    state["anomaly_hits"] += 1
+                    state["normal_hits"] = 0
+                else:
+                    state["normal_hits"] += 1
+                    state["anomaly_hits"] = 0
+
                 LOGGER.info("=" * 60)
-                LOGGER.info(f"TIMESTAMP : {latest_ts}")
-                LOGGER.info(f"POD       : {latest_row['pod']}")
-                LOGGER.info(f"CONTAINER : {latest_row['container']}")
+                LOGGER.info(f"TARGET    : {key}")
                 LOGGER.info(f"SCORE     : {total_score:.6f}")
-                LOGGER.info(f"THRESHOLD : {active_threshold:.6f}")
-                LOGGER.info(f"BASELINE  : {static_threshold:.6f}")
-                LOGGER.info(
-                    f"HISTORY   : {len(state['score_history'])}/{THRESHOLD_HISTORY_SIZE}"
-                )
+                LOGGER.info(f"THRESHOLD : {dynamic_threshold:.6f}")
+                LOGGER.info(f"TOP FEATS : {top_features}")
+                LOGGER.info(f"REASON    : {reason}")
 
-                if total_score > active_threshold:
-                    now = time.time()
+                if (not state["anomaly_active"]) and state["anomaly_hits"] >= ANOMALY_CONSECUTIVE_HITS:
+                    state["anomaly_active"] = True
+                    LOGGER.warning("ANOMALY STARTED")
+                    LOGGER.warning(f"TARGET    : {key}")
+                    LOGGER.warning(f"SCORE     : {total_score:.6f}")
+                    LOGGER.warning(f"THRESHOLD : {dynamic_threshold:.6f}")
+                    LOGGER.warning(f"TOP FEATS : {top_features}")
+                    LOGGER.warning(f"REASON    : {reason}")
 
-                    if not state["anomaly_active"]:
-                        LOGGER.info("STATUS    : ANOMALY STARTED")
-                        state["anomaly_active"] = True
-                        state["last_alert_time"] = now
-                        print_top_metrics(mse_per_feature, latest_row)
-
-                    else:
-                        if now - state["last_alert_time"] >= ALERT_COOLDOWN_SECONDS:
-                            LOGGER.info("STATUS    : ANOMALY STILL ACTIVE")
-                            state["last_alert_time"] = now
-                            print_top_metrics(mse_per_feature, latest_row)
-                        else:
-                            LOGGER.info("STATUS    : ANOMALY ACTIVE (cooldown)")
-
-                    LOGGER.info("-" * 50)
-                    LOGGER.info("LATEST SNAPSHOT:")
-                    LOGGER.info("\n%s", latest_row[FEATURE_COLS].to_frame().T.to_string(index=False))
+                elif state["anomaly_active"] and state["normal_hits"] >= CLEAR_CONSECUTIVE_NORMALS:
+                    state["anomaly_active"] = False
+                    LOGGER.info("ANOMALY CLEARED")
+                    LOGGER.info(f"TARGET    : {key}")
+                    LOGGER.info(f"SCORE     : {total_score:.6f}")
+                    LOGGER.info(f"THRESHOLD : {dynamic_threshold:.6f}")
 
                 else:
-                    state["score_history"].append(total_score)
-                    if state["anomaly_active"]:
-                        LOGGER.info("STATUS    : ANOMALY CLEARED")
-                        state["anomaly_active"] = False
-                    else:
-                        LOGGER.info("STATUS    : NORMAL")
+                    LOGGER.info(f"STATUS    : {'ANOMALY_ACTIVE' if state['anomaly_active'] else 'NORMAL'}")
 
                 LOGGER.info("=" * 60)
 
-            if processed_rows:
-                append_raw_snapshots(pd.DataFrame(processed_rows, columns=FINAL_COLUMNS))
-            else:
-                LOGGER.info("[INFO] No new data. Skipping inference.")
-
         except KeyboardInterrupt:
-            LOGGER.info("[INFO] Stopped by user.")
+            LOGGER.info("Stopped by user.")
             break
         except Exception as e:
-            LOGGER.exception(f"[ERROR] Main loop failed: {e}")
+            LOGGER.exception(f"Loop error: {e}")
 
-        time.sleep(COLLECT_INTERVAL_SECONDS)
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
