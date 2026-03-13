@@ -40,10 +40,9 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ---------------------------------------------------------
 # TARGET FILTERS
 # ---------------------------------------------------------
-TARGET_NAMESPACE = "default"
-TARGET_POD = "chcekone-8464c69d8f-mnr5t"   # exact pod name
-TARGET_CONTAINER = "nginx"
-
+TARGET_NAMESPACE = None
+TARGET_POD = None
+TARGET_CONTAINER = None
 # ---------------------------------------------------------
 # LOOP SETTINGS
 # ---------------------------------------------------------
