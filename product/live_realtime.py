@@ -39,17 +39,19 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---------------------------------------------------------
 # TARGET FILTERS
+# None = monitor all
 # ---------------------------------------------------------
 TARGET_NAMESPACE = None
 TARGET_POD = None
 TARGET_CONTAINER = None
+
 # ---------------------------------------------------------
 # LOOP SETTINGS
 # ---------------------------------------------------------
 POLL_INTERVAL_SECONDS = 30
 WINDOW_SIZE_FALLBACK = 24
 
-# false positive reduction
+# continuous detection tuning
 WARMUP_WINDOWS = 20
 ANOMALY_CONSECUTIVE_HITS = 3
 CLEAR_CONSECUTIVE_NORMALS = 3
@@ -483,7 +485,7 @@ def top_reason(feature_error_map):
     ranked = sorted(feature_error_map.items(), key=lambda kv: kv[1], reverse=True)
     top_features = [k for k, _ in ranked[:3]]
 
-    if "mem_util" in top_features or "mem_rss" in top_features or "mem_cache" in top_features:
+    if "mem_rss" in top_features or "mem_util" in top_features or "mem_cache" in top_features:
         reason = "abnormal memory behavior detected"
     elif "cpu_util" in top_features:
         reason = "abnormal CPU behavior detected"
@@ -506,6 +508,17 @@ def init_container_state():
         "anomaly_hits": 0,
         "normal_hits": 0,
     }
+
+
+def log_status_block(key, score, threshold, top_features, reason, status):
+    LOGGER.info("=" * 60)
+    LOGGER.info(f"TARGET    : {key}")
+    LOGGER.info(f"SCORE     : {score:.6f}")
+    LOGGER.info(f"THRESHOLD : {threshold:.6f}")
+    LOGGER.info(f"TOP FEATS : {top_features}")
+    LOGGER.info(f"REASON    : {reason}")
+    LOGGER.info(f"STATUS    : {status}")
+    LOGGER.info("=" * 60)
 
 
 # =========================================================
@@ -532,14 +545,14 @@ def main():
     states = defaultdict(init_container_state)
     seen_keys = set()
 
-    LOGGER.info("Starting live anomaly detection loop...")
+    LOGGER.info("Starting continuous live anomaly detection loop...")
 
     while True:
         try:
             snapshot = collect_snapshot()
 
             if snapshot.empty:
-                LOGGER.info("No matching rows from Prometheus for target filter.")
+                LOGGER.info("No matching rows from Prometheus for current filter.")
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
@@ -573,31 +586,26 @@ def main():
                 state["score_history"].append(total_score)
                 state["inference_count"] += 1
 
-                if state["inference_count"] <= WARMUP_WINDOWS:
-                    hist = np.array(state["score_history"], dtype=np.float32)
-                    dyn_thr = max(
-                        base_threshold * MIN_THRESHOLD_FACTOR,
-                        float(hist.mean() + DYNAMIC_THRESHOLD_STD_MULTIPLIER * hist.std()) if len(hist) > 1 else base_threshold
-                    )
-
-                    LOGGER.info("=" * 60)
-                    LOGGER.info(f"TARGET    : {key}")
-                    LOGGER.info(f"STATUS    : WARMUP ({state['inference_count']}/{WARMUP_WINDOWS})")
-                    LOGGER.info(f"SCORE     : {total_score:.6f}")
-                    LOGGER.info(f"THRESHOLD : {dyn_thr:.6f}")
-                    LOGGER.info("=" * 60)
-                    continue
-
-                hist = np.array(state["score_history"], dtype=np.float32)
+                hist = np.array(state["score_history"], dtype=np.float64)
 
                 dynamic_threshold = base_threshold
-                if len(hist) > 5:
+                if len(hist) > 1:
                     dynamic_threshold = max(
                         base_threshold * MIN_THRESHOLD_FACTOR,
                         float(hist.mean() + DYNAMIC_THRESHOLD_STD_MULTIPLIER * hist.std())
                     )
 
                 ranked, top_features, reason = top_reason(feature_error_map)
+
+                if state["inference_count"] <= WARMUP_WINDOWS:
+                    LOGGER.info("=" * 60)
+                    LOGGER.info(f"TARGET    : {key}")
+                    LOGGER.info(f"STATUS    : WARMUP ({state['inference_count']}/{WARMUP_WINDOWS})")
+                    LOGGER.info(f"SCORE     : {total_score:.6f}")
+                    LOGGER.info(f"THRESHOLD : {dynamic_threshold:.6f}")
+                    LOGGER.info("=" * 60)
+                    continue
+
                 is_anomaly_now = total_score > dynamic_threshold
 
                 if is_anomaly_now:
@@ -607,33 +615,18 @@ def main():
                     state["normal_hits"] += 1
                     state["anomaly_hits"] = 0
 
-                LOGGER.info("=" * 60)
-                LOGGER.info(f"TARGET    : {key}")
-                LOGGER.info(f"SCORE     : {total_score:.6f}")
-                LOGGER.info(f"THRESHOLD : {dynamic_threshold:.6f}")
-                LOGGER.info(f"TOP FEATS : {top_features}")
-                LOGGER.info(f"REASON    : {reason}")
-
                 if (not state["anomaly_active"]) and state["anomaly_hits"] >= ANOMALY_CONSECUTIVE_HITS:
                     state["anomaly_active"] = True
-                    LOGGER.warning("ANOMALY STARTED")
-                    LOGGER.warning(f"TARGET    : {key}")
-                    LOGGER.warning(f"SCORE     : {total_score:.6f}")
-                    LOGGER.warning(f"THRESHOLD : {dynamic_threshold:.6f}")
-                    LOGGER.warning(f"TOP FEATS : {top_features}")
-                    LOGGER.warning(f"REASON    : {reason}")
+                    log_status_block(key, total_score, dynamic_threshold, top_features, reason, "ANOMALY_STARTED")
+                    continue
 
-                elif state["anomaly_active"] and state["normal_hits"] >= CLEAR_CONSECUTIVE_NORMALS:
+                if state["anomaly_active"] and state["normal_hits"] >= CLEAR_CONSECUTIVE_NORMALS:
                     state["anomaly_active"] = False
-                    LOGGER.info("ANOMALY CLEARED")
-                    LOGGER.info(f"TARGET    : {key}")
-                    LOGGER.info(f"SCORE     : {total_score:.6f}")
-                    LOGGER.info(f"THRESHOLD : {dynamic_threshold:.6f}")
+                    log_status_block(key, total_score, dynamic_threshold, top_features, reason, "ANOMALY_CLEARED")
+                    continue
 
-                else:
-                    LOGGER.info(f"STATUS    : {'ANOMALY_ACTIVE' if state['anomaly_active'] else 'NORMAL'}")
-
-                LOGGER.info("=" * 60)
+                current_status = "ANOMALY_ACTIVE" if state["anomaly_active"] else "NORMAL"
+                log_status_block(key, total_score, dynamic_threshold, top_features, reason, current_status)
 
         except KeyboardInterrupt:
             LOGGER.info("Stopped by user.")
