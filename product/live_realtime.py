@@ -448,33 +448,61 @@ def build_model(ae_meta, x_dim, c_dim):
     model.eval()
     return model
 
-def compute_anomaly_score(x_window, x_scaler, c_scaler, model):
-    x_raw = np.asarray(x_window, dtype=np.float32)
+def compute_anomaly_score(
+    x_window=None,
+    x_scaler=None,
+    c_scaler=None,
+    model=None,
+    window_rows=None,
+    ns_map=None,
+    ct_map=None,
+):
+    if window_rows is not None:
+        if window_rows.empty:
+            raise ValueError("window_rows must contain at least one row")
+        x_raw = window_rows[FEATURE_COLS].to_numpy(dtype=np.float32, copy=True)
+
+        c_dim = infer_context_dim(c_scaler)
+        namespace = str(window_rows.iloc[-1].get("namespace", ""))
+        container = str(window_rows.iloc[-1].get("container", ""))
+        context_raw = build_context_vector(
+            namespace=namespace,
+            container=container,
+            ns_map=ns_map or {},
+            ct_map=ct_map or {},
+            c_dim=c_dim,
+        )
+    else:
+        if x_window is None:
+            raise ValueError("Either x_window or window_rows must be provided")
+        x_raw = np.asarray(x_window, dtype=np.float32)
+        context_raw = np.zeros((1, infer_context_dim(c_scaler)), dtype=np.float32)
 
     # clip invalid negatives
     x_raw = np.clip(x_raw, a_min=0.0, a_max=None)
 
     # IMPORTANT: same preprocessing as training notebook 01
     x_log = np.log1p(x_raw)
-
     x_scaled = x_scaler.transform(x_log)
 
-    x_tensor = torch.FloatTensor(x_scaled).unsqueeze(0).to(DEVICE)
-
-    # current live code uses zero context
-    c_scaled = np.zeros((1, c_scaler.n_features_in_), dtype=np.float32)
-    c_tensor = torch.FloatTensor(c_scaled).to(DEVICE)
+    x_tensor = torch.as_tensor(x_scaled, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+    c_scaled = c_scaler.transform(context_raw)
+    c_tensor = torch.as_tensor(c_scaled, dtype=torch.float32, device=DEVICE)
 
     with torch.no_grad():
         reconstructed = model(x_tensor, c_tensor)
 
-    x_pred_scaled = reconstructed.cpu().numpy().squeeze()
+    x_pred_scaled = reconstructed.detach().cpu().numpy()[0]
 
     errors = (x_scaled - x_pred_scaled) ** 2
     mse_per_feature = np.mean(errors, axis=0)
     total_score = float(np.mean(mse_per_feature))
+    feature_error_map = {
+        feature: float(score)
+        for feature, score in zip(FEATURE_COLS, mse_per_feature.tolist())
+    }
 
-    return total_score, mse_per_feature
+    return total_score, feature_error_map
 
 def top_reason(feature_error_map):
     ranked = sorted(feature_error_map.items(), key=lambda kv: kv[1], reverse=True)
