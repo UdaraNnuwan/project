@@ -18,7 +18,8 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 sys.path.append(PROJECT_ROOT)
 
-from src.model import FiLMAutoencoder  # adjust only if needed
+from src.model import FiLMAutoencoder
+
 
 # =========================================================
 # CONFIG
@@ -33,7 +34,7 @@ DETECTOR_META_PATH = os.path.join(MODEL_DIR, "detector_meta.joblib")
 AE_META_PATH = os.path.join(MODEL_DIR, "ae_model_meta.joblib")
 
 RAW_SNAPSHOT_CSV = os.path.join(CURRENT_DIR, "raw_snapshots.csv")
-LOG_FILE = os.path.join(CURRENT_DIR, "result.log")
+LOG_FILE = os.path.join(CURRENT_DIR, "result_dual_status.log")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -51,16 +52,26 @@ TARGET_CONTAINER = None
 POLL_INTERVAL_SECONDS = 30
 WINDOW_SIZE_FALLBACK = 24
 
-# continuous detection tuning
+# Warmup
 WARMUP_WINDOWS = 20
-ANOMALY_CONSECUTIVE_HITS = 3
-CLEAR_CONSECUTIVE_NORMALS = 3
-SCORE_HISTORY_SIZE = 100
-DYNAMIC_THRESHOLD_STD_MULTIPLIER = 4.0
-MIN_THRESHOLD_FACTOR = 1.0
+
+# ALL feature anomaly logic
+ALL_ANOMALY_CONSECUTIVE_HITS = 3
+ALL_CLEAR_CONSECUTIVE_NORMALS = 3
+ALL_SCORE_HISTORY_SIZE = 100
+ALL_DYNAMIC_THRESHOLD_STD_MULTIPLIER = 4.0
+ALL_MIN_THRESHOLD_FACTOR = 1.0
+
+# TOP feature anomaly logic
+TOPK = 3
+TOP_ANOMALY_CONSECUTIVE_HITS = 2
+TOP_CLEAR_CONSECUTIVE_NORMALS = 2
+TOP_SCORE_HISTORY_SIZE = 100
+TOP_DYNAMIC_THRESHOLD_STD_MULTIPLIER = 4.0
+TOP_MIN_THRESHOLD_FACTOR = 1.0
 
 # ---------------------------------------------------------
-# LIVE FEATURES (must match training count/order)
+# FEATURES
 # ---------------------------------------------------------
 FEATURE_COLS = [
     "cpu_util",
@@ -76,7 +87,7 @@ FEATURE_COLS = [
 # =========================================================
 # LOGGING
 # =========================================================
-LOGGER = logging.getLogger("live_realtime")
+LOGGER = logging.getLogger("live_realtime_dual")
 LOGGER.setLevel(logging.INFO)
 LOGGER.handlers.clear()
 
@@ -258,7 +269,6 @@ def result_to_df(results, metric_name: str) -> pd.DataFrame:
     for item in results:
         metric = item.get("metric", {})
         value = item.get("value", [None, None])
-
         labels = normalize_metric_labels(metric)
 
         if metric_name in ("net_in", "net_out") and not labels["container"]:
@@ -335,8 +345,7 @@ def collect_snapshot() -> pd.DataFrame:
 
     merged = merged.fillna(0.0)
 
-    now = datetime.now(timezone.utc).isoformat()
-    merged["timestamp"] = now
+    merged["timestamp"] = datetime.now(timezone.utc).isoformat()
 
     final_cols = ["timestamp", "namespace", "pod", "container"] + FEATURE_COLS
     for c in final_cols:
@@ -448,45 +457,38 @@ def build_model(ae_meta, x_dim, c_dim):
     model.eval()
     return model
 
+
 def compute_anomaly_score(
-    x_window=None,
-    x_scaler=None,
-    c_scaler=None,
-    model=None,
-    window_rows=None,
-    ns_map=None,
-    ct_map=None,
+    window_rows: pd.DataFrame,
+    x_scaler,
+    c_scaler,
+    model,
+    ns_map,
+    ct_map,
 ):
-    if window_rows is not None:
-        if window_rows.empty:
-            raise ValueError("window_rows must contain at least one row")
-        x_raw = window_rows[FEATURE_COLS].to_numpy(dtype=np.float32, copy=True)
+    if window_rows.empty:
+        raise ValueError("window_rows must contain at least one row")
 
-        c_dim = infer_context_dim(c_scaler)
-        namespace = str(window_rows.iloc[-1].get("namespace", ""))
-        container = str(window_rows.iloc[-1].get("container", ""))
-        context_raw = build_context_vector(
-            namespace=namespace,
-            container=container,
-            ns_map=ns_map or {},
-            ct_map=ct_map or {},
-            c_dim=c_dim,
-        )
-    else:
-        if x_window is None:
-            raise ValueError("Either x_window or window_rows must be provided")
-        x_raw = np.asarray(x_window, dtype=np.float32)
-        context_raw = np.zeros((1, infer_context_dim(c_scaler)), dtype=np.float32)
-
-    # clip invalid negatives
+    x_raw = window_rows[FEATURE_COLS].to_numpy(dtype=np.float32, copy=True)
     x_raw = np.clip(x_raw, a_min=0.0, a_max=None)
 
-    # IMPORTANT: same preprocessing as training notebook 01
     x_log = np.log1p(x_raw)
     x_scaled = x_scaler.transform(x_log)
 
-    x_tensor = torch.as_tensor(x_scaled, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+    c_dim = infer_context_dim(c_scaler)
+    namespace = str(window_rows.iloc[-1].get("namespace", ""))
+    container = str(window_rows.iloc[-1].get("container", ""))
+
+    context_raw = build_context_vector(
+        namespace=namespace,
+        container=container,
+        ns_map=ns_map,
+        ct_map=ct_map,
+        c_dim=c_dim,
+    )
     c_scaled = c_scaler.transform(context_raw)
+
+    x_tensor = torch.as_tensor(x_scaled, dtype=torch.float32, device=DEVICE).unsqueeze(0)
     c_tensor = torch.as_tensor(c_scaled, dtype=torch.float32, device=DEVICE)
 
     with torch.no_grad():
@@ -496,51 +498,128 @@ def compute_anomaly_score(
 
     errors = (x_scaled - x_pred_scaled) ** 2
     mse_per_feature = np.mean(errors, axis=0)
-    total_score = float(np.mean(mse_per_feature))
+
     feature_error_map = {
         feature: float(score)
         for feature, score in zip(FEATURE_COLS, mse_per_feature.tolist())
     }
 
-    return total_score, feature_error_map
+    # all feature score
+    all_score = float(np.mean(mse_per_feature))
 
-def top_reason(feature_error_map):
+    # top-k feature score
     ranked = sorted(feature_error_map.items(), key=lambda kv: kv[1], reverse=True)
-    top_features = [k for k, _ in ranked[:3]]
+    top_features = [k for k, _ in ranked[:TOPK]]
+    top_feature_scores = [v for _, v in ranked[:TOPK]]
+    top_score = float(np.mean(top_feature_scores)) if top_feature_scores else 0.0
 
+    return all_score, top_score, feature_error_map, ranked, top_features
+
+
+def reason_from_top_features(top_features):
     if "mem_rss" in top_features or "mem_util" in top_features or "mem_cache" in top_features:
-        reason = "abnormal memory behavior detected"
-    elif "cpu_util" in top_features:
-        reason = "abnormal CPU behavior detected"
-    elif "net_in" in top_features or "net_out" in top_features:
-        reason = "abnormal network behavior detected"
-    elif "disk_read" in top_features or "disk_write" in top_features:
-        reason = "abnormal disk I/O behavior detected"
-    else:
-        reason = "abnormal multivariate behavior detected"
-
-    return ranked, top_features, reason
+        return "abnormal memory behavior detected"
+    if "cpu_util" in top_features:
+        return "abnormal CPU behavior detected"
+    if "net_in" in top_features or "net_out" in top_features:
+        return "abnormal network behavior detected"
+    if "disk_read" in top_features or "disk_write" in top_features:
+        return "abnormal disk I/O behavior detected"
+    return "abnormal multivariate behavior detected"
 
 
 def init_container_state():
     return {
         "window_buffer": deque(),
-        "score_history": deque(maxlen=SCORE_HISTORY_SIZE),
+
+        "all_score_history": deque(maxlen=ALL_SCORE_HISTORY_SIZE),
+        "top_score_history": deque(maxlen=TOP_SCORE_HISTORY_SIZE),
+
         "inference_count": 0,
-        "anomaly_active": False,
-        "anomaly_hits": 0,
-        "normal_hits": 0,
+
+        "all_anomaly_active": False,
+        "all_anomaly_hits": 0,
+        "all_normal_hits": 0,
+
+        "top_anomaly_active": False,
+        "top_anomaly_hits": 0,
+        "top_normal_hits": 0,
     }
 
 
-def log_status_block(key, score, threshold, top_features, reason, status):
+def compute_dynamic_threshold(score_history, base_threshold, multiplier, min_factor):
+    hist = np.array(score_history, dtype=np.float64)
+    if len(hist) <= 1:
+        return float(base_threshold)
+
+    return max(
+        float(base_threshold) * float(min_factor),
+        float(hist.mean() + multiplier * hist.std())
+    )
+
+
+def format_all_feature_errors(ranked):
+    return ", ".join([f"{k}={v:.6f}" for k, v in ranked])
+
+
+def update_status(
+    score,
+    threshold,
+    active_flag_name,
+    hit_name,
+    normal_name,
+    state,
+    anomaly_hits_needed,
+    normal_hits_needed,
+):
+    is_anomaly_now = score > threshold
+
+    if is_anomaly_now:
+        state[hit_name] += 1
+        state[normal_name] = 0
+    else:
+        state[normal_name] += 1
+        state[hit_name] = 0
+
+    status_changed = None
+
+    if (not state[active_flag_name]) and state[hit_name] >= anomaly_hits_needed:
+        state[active_flag_name] = True
+        status_changed = "STARTED"
+    elif state[active_flag_name] and state[normal_name] >= normal_hits_needed:
+        state[active_flag_name] = False
+        status_changed = "CLEARED"
+
+    current_status = "ANOMALY_ACTIVE" if state[active_flag_name] else "NORMAL"
+    return is_anomaly_now, current_status, status_changed
+
+
+def log_dual_status_block(
+    key,
+    all_score,
+    all_threshold,
+    all_status,
+    top_score,
+    top_threshold,
+    top_status,
+    top_features,
+    reason,
+    ranked,
+):
     LOGGER.info("=" * 60)
-    LOGGER.info(f"TARGET    : {key}")
-    LOGGER.info(f"SCORE     : {score:.6f}")
-    LOGGER.info(f"THRESHOLD : {threshold:.6f}")
-    LOGGER.info(f"TOP FEATS : {top_features}")
-    LOGGER.info(f"REASON    : {reason}")
-    LOGGER.info(f"STATUS    : {status}")
+    LOGGER.info(f"TARGET            : {key}")
+
+    LOGGER.info(f"ALL_SCORE         : {all_score:.6f}")
+    LOGGER.info(f"ALL_THRESHOLD     : {all_threshold:.6f}")
+    LOGGER.info(f"ALL_STATUS        : {all_status}")
+
+    LOGGER.info(f"TOP_SCORE         : {top_score:.6f}")
+    LOGGER.info(f"TOP_THRESHOLD     : {top_threshold:.6f}")
+    LOGGER.info(f"TOP_FEATS         : {top_features}")
+    LOGGER.info(f"TOP_REASON        : {reason}")
+    LOGGER.info(f"TOP_STATUS        : {top_status}")
+
+    LOGGER.info(f"ALL_FEATURE_ERRORS: {format_all_feature_errors(ranked)}")
     LOGGER.info("=" * 60)
 
 
@@ -559,16 +638,16 @@ def main():
     window_size = extract_window_size(ae_meta, detector_meta)
     c_dim = infer_context_dim(c_scaler)
 
-    LOGGER.info(f"Base threshold: {base_threshold}")
-    LOGGER.info(f"Window size   : {window_size}")
-    LOGGER.info(f"Context dim   : {c_dim}")
+    LOGGER.info(f"Base threshold : {base_threshold}")
+    LOGGER.info(f"Window size    : {window_size}")
+    LOGGER.info(f"Context dim    : {c_dim}")
 
     model = build_model(ae_meta, len(FEATURE_COLS), c_dim)
 
     states = defaultdict(init_container_state)
     seen_keys = set()
 
-    LOGGER.info("Starting continuous live anomaly detection loop...")
+    LOGGER.info("Starting continuous dual-status anomaly detection loop...")
 
     while True:
         try:
@@ -597,59 +676,96 @@ def main():
                 ns_map, ct_map = build_label_maps(seen_keys)
                 window_df = pd.DataFrame(list(state["window_buffer"]))
 
-                total_score, feature_error_map = compute_anomaly_score(
-                    model=model,
+                all_score, top_score, feature_error_map, ranked, top_features = compute_anomaly_score(
+                    window_rows=window_df,
                     x_scaler=x_scaler,
                     c_scaler=c_scaler,
-                    window_rows=window_df,
+                    model=model,
                     ns_map=ns_map,
-                    ct_map=ct_map
+                    ct_map=ct_map,
                 )
 
-                state["score_history"].append(total_score)
+                reason = reason_from_top_features(top_features)
+
+                state["all_score_history"].append(all_score)
+                state["top_score_history"].append(top_score)
                 state["inference_count"] += 1
 
-                hist = np.array(state["score_history"], dtype=np.float64)
+                all_threshold = compute_dynamic_threshold(
+                    state["all_score_history"],
+                    base_threshold=base_threshold,
+                    multiplier=ALL_DYNAMIC_THRESHOLD_STD_MULTIPLIER,
+                    min_factor=ALL_MIN_THRESHOLD_FACTOR,
+                )
 
-                dynamic_threshold = base_threshold
-                if len(hist) > 1:
-                    dynamic_threshold = max(
-                        base_threshold * MIN_THRESHOLD_FACTOR,
-                        float(hist.mean() + DYNAMIC_THRESHOLD_STD_MULTIPLIER * hist.std())
-                    )
-
-                ranked, top_features, reason = top_reason(feature_error_map)
+                # top threshold derived from current top score history
+                # use base threshold scaled down to top-k proportion
+                top_base_threshold = float(base_threshold) * (TOPK / len(FEATURE_COLS))
+                top_threshold = compute_dynamic_threshold(
+                    state["top_score_history"],
+                    base_threshold=top_base_threshold,
+                    multiplier=TOP_DYNAMIC_THRESHOLD_STD_MULTIPLIER,
+                    min_factor=TOP_MIN_THRESHOLD_FACTOR,
+                )
 
                 if state["inference_count"] <= WARMUP_WINDOWS:
                     LOGGER.info("=" * 60)
-                    LOGGER.info(f"TARGET    : {key}")
-                    LOGGER.info(f"STATUS    : WARMUP ({state['inference_count']}/{WARMUP_WINDOWS})")
-                    LOGGER.info(f"SCORE     : {total_score:.6f}")
-                    LOGGER.info(f"THRESHOLD : {dynamic_threshold:.6f}")
+                    LOGGER.info(f"TARGET            : {key}")
+                    LOGGER.info(f"STATUS            : WARMUP ({state['inference_count']}/{WARMUP_WINDOWS})")
+                    LOGGER.info(f"ALL_SCORE         : {all_score:.6f}")
+                    LOGGER.info(f"ALL_THRESHOLD     : {all_threshold:.6f}")
+                    LOGGER.info(f"TOP_SCORE         : {top_score:.6f}")
+                    LOGGER.info(f"TOP_THRESHOLD     : {top_threshold:.6f}")
+                    LOGGER.info(f"TOP_FEATS         : {top_features}")
+                    LOGGER.info(f"TOP_REASON        : {reason}")
+                    LOGGER.info(f"ALL_FEATURE_ERRORS: {format_all_feature_errors(ranked)}")
                     LOGGER.info("=" * 60)
                     continue
 
-                is_anomaly_now = total_score > dynamic_threshold
+                _, all_status, all_changed = update_status(
+                    score=all_score,
+                    threshold=all_threshold,
+                    active_flag_name="all_anomaly_active",
+                    hit_name="all_anomaly_hits",
+                    normal_name="all_normal_hits",
+                    state=state,
+                    anomaly_hits_needed=ALL_ANOMALY_CONSECUTIVE_HITS,
+                    normal_hits_needed=ALL_CLEAR_CONSECUTIVE_NORMALS,
+                )
 
-                if is_anomaly_now:
-                    state["anomaly_hits"] += 1
-                    state["normal_hits"] = 0
-                else:
-                    state["normal_hits"] += 1
-                    state["anomaly_hits"] = 0
+                _, top_status, top_changed = update_status(
+                    score=top_score,
+                    threshold=top_threshold,
+                    active_flag_name="top_anomaly_active",
+                    hit_name="top_anomaly_hits",
+                    normal_name="top_normal_hits",
+                    state=state,
+                    anomaly_hits_needed=TOP_ANOMALY_CONSECUTIVE_HITS,
+                    normal_hits_needed=TOP_CLEAR_CONSECUTIVE_NORMALS,
+                )
 
-                if (not state["anomaly_active"]) and state["anomaly_hits"] >= ANOMALY_CONSECUTIVE_HITS:
-                    state["anomaly_active"] = True
-                    log_status_block(key, total_score, dynamic_threshold, top_features, reason, "ANOMALY_STARTED")
-                    continue
+                if all_changed == "STARTED":
+                    all_status = "ANOMALY_STARTED"
+                elif all_changed == "CLEARED":
+                    all_status = "ANOMALY_CLEARED"
 
-                if state["anomaly_active"] and state["normal_hits"] >= CLEAR_CONSECUTIVE_NORMALS:
-                    state["anomaly_active"] = False
-                    log_status_block(key, total_score, dynamic_threshold, top_features, reason, "ANOMALY_CLEARED")
-                    continue
+                if top_changed == "STARTED":
+                    top_status = "ANOMALY_STARTED"
+                elif top_changed == "CLEARED":
+                    top_status = "ANOMALY_CLEARED"
 
-                current_status = "ANOMALY_ACTIVE" if state["anomaly_active"] else "NORMAL"
-                log_status_block(key, total_score, dynamic_threshold, top_features, reason, current_status)
+                log_dual_status_block(
+                    key=key,
+                    all_score=all_score,
+                    all_threshold=all_threshold,
+                    all_status=all_status,
+                    top_score=top_score,
+                    top_threshold=top_threshold,
+                    top_status=top_status,
+                    top_features=top_features,
+                    reason=reason,
+                    ranked=ranked,
+                )
 
         except KeyboardInterrupt:
             LOGGER.info("Stopped by user.")
