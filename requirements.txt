@@ -1,0 +1,9 @@
+joblib
+numpy
+pandas
+requests
+scikit-learn
+torch
+
+# Optional: only needed if you use src/model_old.py or the old Keras/TensorFlow path.
+# tensorflow

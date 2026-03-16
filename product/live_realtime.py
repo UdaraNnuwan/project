@@ -448,38 +448,33 @@ def build_model(ae_meta, x_dim, c_dim):
     model.eval()
     return model
 
+def compute_anomaly_score(x_window, x_scaler, c_scaler, model):
+    x_raw = np.asarray(x_window, dtype=np.float32)
 
-def compute_anomaly_score(model, x_scaler, c_scaler, window_rows, ns_map, ct_map):
-    x = window_rows[FEATURE_COLS].values.astype(np.float32)
-    x_scaled = x_scaler.transform(x)
+    # clip invalid negatives
+    x_raw = np.clip(x_raw, a_min=0.0, a_max=None)
 
-    namespace = str(window_rows["namespace"].iloc[-1])
-    container = str(window_rows["container"].iloc[-1])
+    # IMPORTANT: same preprocessing as training notebook 01
+    x_log = np.log1p(x_raw)
 
-    c_dim = infer_context_dim(c_scaler)
-    c_raw = build_context_vector(namespace, container, ns_map, ct_map, c_dim)
-    c_scaled = c_scaler.transform(c_raw)
+    x_scaled = x_scaler.transform(x_log)
 
-    x_tensor = torch.tensor(x_scaled, dtype=torch.float32).unsqueeze(0).to(DEVICE)
-    c_tensor = torch.tensor(c_scaled, dtype=torch.float32).to(DEVICE)
+    x_tensor = torch.FloatTensor(x_scaled).unsqueeze(0).to(DEVICE)
+
+    # current live code uses zero context
+    c_scaled = np.zeros((1, c_scaler.n_features_in_), dtype=np.float32)
+    c_tensor = torch.FloatTensor(c_scaled).to(DEVICE)
 
     with torch.no_grad():
-        x_hat = model(x_tensor, c_tensor)
+        reconstructed = model(x_tensor, c_tensor)
 
-    x_true_scaled = x_tensor.squeeze(0).cpu().numpy()
-    x_pred_scaled = x_hat.squeeze(0).cpu().numpy()
+    x_pred_scaled = reconstructed.cpu().numpy().squeeze()
 
-    sq_err = (x_true_scaled - x_pred_scaled) ** 2
-    total_score = float(np.mean(sq_err))
-    per_feature = sq_err.mean(axis=0)
+    errors = (x_scaled - x_pred_scaled) ** 2
+    mse_per_feature = np.mean(errors, axis=0)
+    total_score = float(np.mean(mse_per_feature))
 
-    feature_error_map = {
-        FEATURE_COLS[i]: float(per_feature[i])
-        for i in range(len(FEATURE_COLS))
-    }
-
-    return total_score, feature_error_map
-
+    return total_score, mse_per_feature
 
 def top_reason(feature_error_map):
     ranked = sorted(feature_error_map.items(), key=lambda kv: kv[1], reverse=True)
