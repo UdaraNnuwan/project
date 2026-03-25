@@ -1,0 +1,6 @@
+{
+  "strict_event_recall": 0.006129955046996322,
+  "relaxed_event_recall": 0.007764609726195341,
+  "mean_detection_delay": 0.47368421052631576,
+  "num_events": 2447
+}
