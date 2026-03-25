@@ -1,0 +1,26 @@
+{
+  "name": "container_anomaly_adjudication",
+  "description": "Structured adjudication result for a multivariate container anomaly candidate.",
+  "strict": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "label": {
+        "type": "string",
+        "enum": ["anomaly", "false_positive", "needs_review"]
+      },
+      "severity": {
+        "type": "string",
+        "enum": ["none", "low", "medium", "high", "critical"]
+      },
+      "explanation": {
+        "type": "string"
+      },
+      "recommended_action": {
+        "type": "string"
+      }
+    },
+    "required": ["label", "severity", "explanation", "recommended_action"]
+  }
+}

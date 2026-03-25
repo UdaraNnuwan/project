@@ -1,0 +1,32 @@
+You are adjudicating a post-threshold multivariate container anomaly detected by an autoencoder.
+
+Use the evidence below to decide whether this is a true anomaly, a false positive, or a case that needs review.
+
+Return a JSON object that matches the provided schema. Do not include markdown or any extra commentary.
+
+Scoring context:
+- anomaly_score: {anomaly_score}
+- threshold: {threshold}
+- normalized_score: {normalized_score}
+
+Context metadata:
+{context_metadata}
+
+Top anomalous features:
+{top_k_features}
+
+Top anomalous feature errors:
+{top_k_feature_errors}
+
+Recent logs:
+{recent_logs}
+
+Recent events:
+{recent_events}
+
+Decision rules:
+- Use `false_positive` when the anomaly appears weak, noisy, or not operationally meaningful.
+- Use `needs_review` when the signal is ambiguous and needs human validation.
+- Use `anomaly` when the evidence indicates a credible operational issue.
+- Severity must be one of: none, low, medium, high, critical.
+- `recommended_action` should be short, specific, and operationally useful.

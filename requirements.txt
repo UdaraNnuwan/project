@@ -1,6 +1,9 @@
 joblib
+matplotlib
 numpy
+openai
 pandas
+python-dotenv
 requests
 scikit-learn
 torch

@@ -1,4 +1,11 @@
+.env
+.env.*
+!.env.example
+
 data/
+artifacts/
+**/__pycache__/
+.jupyter_runtime/
 venv/
 **/venv/
 .venv/
