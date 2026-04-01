@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,9 @@ from utils import choose_device, ensure_directory
 ENABLE_GPT_LOGGING = True
 TELEGRAM_SEND_ALL_RESULTS = True
 TELEGRAM_SKIP_NORMAL_RESULTS = True
+DYNAMIC_THRESHOLD_BUFFER_SIZE = 300
+DYNAMIC_THRESHOLD_PERCENTILE = 99.0
+DYNAMIC_THRESHOLD_MIN_BUFFER = 50
 
 
 def to_float(value: Any, default: float = 0.0) -> float:
@@ -135,6 +139,22 @@ class EntityStatePreprocessor:
         categorical_vector = self.category_encoder.encode(categorical_payload)
         context_vector = np.concatenate([numeric_vector, categorical_vector], axis=0).astype(np.float32)
         return cleaned_features, context_vector
+
+
+class DynamicThreshold:
+    def __init__(self, buffer_size: int, percentile: float, min_buffer: int) -> None:
+        self.buffer = deque(maxlen=max(1, int(buffer_size)))
+        self.percentile = float(percentile)
+        self.min_buffer = max(1, int(min_buffer))
+
+    def current_threshold(self) -> float | None:
+        if len(self.buffer) < self.min_buffer:
+            return None
+        scores = np.asarray(self.buffer, dtype=np.float32)
+        return float(np.percentile(scores, self.percentile))
+
+    def observe(self, score: float) -> None:
+        self.buffer.append(float(score))
 
 
 @dataclass
@@ -341,12 +361,20 @@ class DirectPrometheusAnomalyRunner:
         self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
         self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
         self.telegram_enabled = bool(self.telegram_bot_token and self.telegram_chat_id)
+        self.dynamic_threshold = DynamicThreshold(
+            buffer_size=DYNAMIC_THRESHOLD_BUFFER_SIZE,
+            percentile=DYNAMIC_THRESHOLD_PERCENTILE,
+            min_buffer=DYNAMIC_THRESHOLD_MIN_BUFFER,
+        )
         self.last_notified_at: dict[str, int] = {}
         self.last_skip_logged_at: dict[tuple[str, str], int] = {}
         self.ready_window_counts: dict[str, int] = {}
 
         log_dir = ensure_directory((config.results_dir / config.model_dir.name).resolve())
         self.decision_log_path = log_dir / "live_gpt_decisions.jsonl"
+        self.gpt_response_log_path = log_dir / "live_gpt_responses.jsonl"
+        self.telegram_log_path = log_dir / "live_telegram_messages.jsonl"
+        self.threshold_log_path = log_dir / "live_threshold_decisions.jsonl"
 
         if not DOTENV_AVAILABLE:
             print("[WARN] python-dotenv is not installed. .env loading may be skipped.")
@@ -679,13 +707,17 @@ class DirectPrometheusAnomalyRunner:
         )
 
         window_id = int(self.ready_window_counts.get(entity_id, 0))
+        fixed_threshold = float(self.detector.threshold)
         response = {
             "entity_id": entity_id,
             "container_id": container,
             "machine_id": machine_id,
             "window_id": window_id,
             "window_ready": bool(result.ready),
-            "threshold": float(self.detector.threshold),
+            "threshold": fixed_threshold,
+            "fixed_threshold": fixed_threshold,
+            "dynamic_threshold": None,
+            "final_threshold": fixed_threshold,
             "window_size": int(self.detector.window_size),
             "namespace": namespace,
             "pod": pod,
@@ -705,20 +737,27 @@ class DirectPrometheusAnomalyRunner:
 
         self.ready_window_counts[entity_id] = window_id + 1
         anomaly_score = float(result.anomaly_score or 0.0)
-        threshold = float(self.detector.threshold)
-        predicted_label = int(result.predicted_label or 0)
+        dynamic_threshold = self.dynamic_threshold.current_threshold()
+        final_threshold = max(fixed_threshold, dynamic_threshold) if dynamic_threshold is not None else fixed_threshold
+        predicted_label = int(anomaly_score > final_threshold)
+        self.dynamic_threshold.observe(anomaly_score)
         response.update(
             {
                 "status": "anomaly" if predicted_label == 1 else "normal",
                 "predicted_label": predicted_label,
                 "anomaly_score": anomaly_score,
-                "score_over_threshold": anomaly_score - threshold,
+                "threshold": final_threshold,
+                "fixed_threshold": fixed_threshold,
+                "dynamic_threshold": dynamic_threshold,
+                "final_threshold": final_threshold,
+                "score_over_threshold": anomaly_score - final_threshold,
                 "top_k_features": result.top_k_features or [],
                 "top_k_feature_errors": result.top_k_feature_errors or [],
                 "feature_error_vector": result.feature_error_vector or [],
                 "metadata": result.metadata or {},
             }
         )
+        self.log_threshold_decision(response)
         return response
 
     def adjudicate_with_gpt(self, candidate: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -824,13 +863,14 @@ class DirectPrometheusAnomalyRunner:
         if not self.telegram_enabled:
             return False, "missing_telegram_credentials"
 
+        message_text = self.format_telegram_alert(decision)
         endpoint = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
         try:
             response = requests.post(
                 endpoint,
                 json={
                     "chat_id": self.telegram_chat_id,
-                    "text": self.format_telegram_alert(decision),
+                    "text": message_text,
                     "disable_web_page_preview": True,
                 },
                 timeout=max(1, int(self.config.request_timeout)),
@@ -838,10 +878,29 @@ class DirectPrometheusAnomalyRunner:
             response.raise_for_status()
             body = response.json()
             if not body.get("ok", False):
+                self.log_telegram_message(
+                    decision=decision,
+                    message_text=message_text,
+                    sent=False,
+                    error=f"telegram_send_failed:{body.get('description', 'unknown_error')}",
+                )
                 return False, f"telegram_send_failed:{body.get('description', 'unknown_error')}"
+            self.log_telegram_message(
+                decision=decision,
+                message_text=message_text,
+                sent=True,
+                error=None,
+            )
             return True, None
         except Exception as exc:
-            return False, f"telegram_send_failed:{compact_reason(str(exc), limit=120)}"
+            error_text = f"telegram_send_failed:{compact_reason(str(exc), limit=120)}"
+            self.log_telegram_message(
+                decision=decision,
+                message_text=message_text,
+                sent=False,
+                error=error_text,
+            )
+            return False, error_text
 
     def log_gpt_decision(self, decision: dict[str, Any], telegram_sent: bool) -> None:
         payload = {
@@ -857,6 +916,61 @@ class DirectPrometheusAnomalyRunner:
             "telegram_sent": bool(telegram_sent),
         }
         append_jsonl(self.decision_log_path, payload)
+
+    def log_gpt_response(self, decision: dict[str, Any], status: str) -> None:
+        payload = {
+            "timestamp": now_iso(),
+            "entity_id": decision.get("entity_id"),
+            "container_id": decision.get("container_id"),
+            "machine_id": decision.get("machine_id"),
+            "anomaly_score": decision.get("anomaly_score"),
+            "threshold": decision.get("threshold"),
+            "status": status,
+            "response_id": decision.get("response_id"),
+            "gpt_model": decision.get("gpt_model"),
+            "label": decision.get("label"),
+            "severity": decision.get("severity"),
+            "explanation": decision.get("explanation"),
+            "recommended_action": decision.get("recommended_action"),
+            "structured_json": decision.get("structured_json"),
+            "gpt_input_summary": decision.get("gpt_input_summary"),
+        }
+        append_jsonl(self.gpt_response_log_path, payload)
+
+    def log_telegram_message(
+        self,
+        decision: dict[str, Any],
+        message_text: str,
+        sent: bool,
+        error: str | None,
+    ) -> None:
+        payload = {
+            "timestamp": now_iso(),
+            "entity_id": decision.get("entity_id"),
+            "container_id": decision.get("container_id"),
+            "machine_id": decision.get("machine_id"),
+            "anomaly_score": decision.get("anomaly_score"),
+            "threshold": decision.get("threshold"),
+            "label": decision.get("label"),
+            "severity": decision.get("severity"),
+            "recommended_action": decision.get("recommended_action"),
+            "telegram_sent": bool(sent),
+            "error": error,
+            "message_text": message_text,
+        }
+        append_jsonl(self.telegram_log_path, payload)
+
+    def log_threshold_decision(self, window_result: dict[str, Any]) -> None:
+        payload = {
+            "timestamp": now_iso(),
+            "entity_id": window_result.get("entity_id"),
+            "score": window_result.get("anomaly_score"),
+            "fixed_threshold": window_result.get("fixed_threshold"),
+            "dynamic_threshold": window_result.get("dynamic_threshold"),
+            "final_threshold": window_result.get("final_threshold"),
+            "decision": window_result.get("status"),
+        }
+        append_jsonl(self.threshold_log_path, payload)
 
     def should_print_skip(self, entity_id: str, reason: str, time_stamp: int) -> bool:
         key = (entity_id, reason)
@@ -891,6 +1005,7 @@ class DirectPrometheusAnomalyRunner:
 
         if str(decision["label"]).strip().lower() == "normal":
             print(f"[GPT-NORMAL] {entity_id} | skipped")
+            self.log_gpt_response(decision, status="normal_skipped")
             if ENABLE_GPT_LOGGING:
                 self.log_gpt_decision(decision, telegram_sent=False)
             return
@@ -899,6 +1014,7 @@ class DirectPrometheusAnomalyRunner:
             f"[GPT-ALERT] {entity_id} | "
             f"label={decision['label']} | severity={decision['severity']}"
         )
+        self.log_gpt_response(decision, status="alert_candidate")
 
         should_send, skip_reason = self.should_send_telegram_result(decision)
         if not should_send:
@@ -955,6 +1071,15 @@ class DirectPrometheusAnomalyRunner:
         print(f"Device    : requested={self.config.device} resolved={self.resolved_device}")
         print(f"Cooldown  : {self.config.cooldown_seconds}s")
         print(f"Log file  : {self.decision_log_path}")
+        print(f"GPT log   : {self.gpt_response_log_path}")
+        print(f"Telegram log: {self.telegram_log_path}")
+        print(f"Threshold log: {self.threshold_log_path}")
+        print(
+            "Adaptive threshold: "
+            f"buffer={DYNAMIC_THRESHOLD_BUFFER_SIZE}, "
+            f"percentile={DYNAMIC_THRESHOLD_PERCENTILE}, "
+            f"min_buffer={DYNAMIC_THRESHOLD_MIN_BUFFER}"
+        )
         print(f"Interval  : {self.config.poll_interval}s")
         while True:
             try:
