@@ -3,3 +3,16 @@ venv/
 **/venv/
 .venv/
 **/.venv/
+.env
+.jupyter_runtime/
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+__pycache__/
+**/__pycache__/
+*.pyc
+product/result.log
+product/raw_snapshots.csv
+prometheus/prometheus_timeseries_metrics.csv
+artifacts/research_pipeline_smoke_auto/
+data/research_processed_smoke_auto/
+results/
