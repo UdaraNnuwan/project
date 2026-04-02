@@ -222,6 +222,8 @@ class EvalConfig:
     telegram_timeout_seconds: int = 15
     random_seed: int = 42
     device: str = "cuda"
+    verbose: bool = True
+    show_progress: bool = True
 
     @property
     def telegram_bot_token(self) -> str | None:

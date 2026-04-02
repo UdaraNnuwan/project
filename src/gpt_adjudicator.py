@@ -283,6 +283,7 @@ def adjudicate_anomaly(
         "gpt_model": call_meta.get("model", config.model),
         "response_id": call_meta.get("response_id"),
         "call_reason": call_meta.get("reason"),
+        "call_error": call_meta.get("error"),
     }
 
 

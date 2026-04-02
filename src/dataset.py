@@ -686,7 +686,26 @@ def _streaming_config_from_dataset_config(config: DatasetConfig) -> StreamingTra
 
 
 def _create_memmap(path: Path, shape: tuple[int, ...]) -> np.memmap:
-    return np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=shape)
+    ensure_directory(path.parent)
+    if path.exists():
+        try:
+            path.unlink()
+        except PermissionError as exc:
+            raise OSError(
+                f"Cannot overwrite existing dataset artifact at '{path}'. "
+                "On Windows this usually means the .npy file is still open in the current "
+                "Jupyter kernel or another Python process. Restart the kernel or write to a "
+                "new output directory before rebuilding the dataset."
+            ) from exc
+
+    try:
+        return np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=shape)
+    except OSError as exc:
+        raise OSError(
+            f"Failed to create memmap '{path}' with shape={shape}. "
+            "If this output directory was used earlier in the notebook, restart the kernel "
+            "or switch to a fresh dataset output directory before rebuilding."
+        ) from exc
 
 
 def _write_split_memmaps(

@@ -34,22 +34,24 @@ load_dotenv(Path(PROJECT_ROOT) / ".env")
 from config import DatasetConfig, GPTConfig, RESULTS_DIR
 from evaluate import StreamingFiLMAnomalyDetector
 from gpt_adjudicator import (
-    RECOMMENDED_ACTIONS,
-    RESPONSE_JSON_SCHEMA,
-    VALID_LABELS,
-    VALID_SEVERITIES,
-    build_window_summary,
-    load_prompt_template,
+    adjudicate_anomaly,
 )
 from model import build_model_from_checkpoint
+from telegram_utils import format_telegram_alert, send_telegram_message
 from utils import choose_device, ensure_directory
 
 ENABLE_GPT_LOGGING = True
 TELEGRAM_SEND_ALL_RESULTS = True
 TELEGRAM_SKIP_NORMAL_RESULTS = True
-DYNAMIC_THRESHOLD_BUFFER_SIZE = 300
-DYNAMIC_THRESHOLD_PERCENTILE = 99.0
-DYNAMIC_THRESHOLD_MIN_BUFFER = 50
+ROLLING_SCORE_BUFFER_SIZE = 500
+ROLLING_SCORE_PERCENTILE = 99.0
+ROLLING_SCORE_MIN_BUFFER = 100
+ENABLE_ZSCORE_CANDIDATE = True
+ZSCORE_THRESHOLD = 3.0
+ENABLE_FEATURE_SHIFT_CANDIDATE = True
+FEATURE_SHIFT_ZSCORE_THRESHOLD = 3.0
+FEATURE_SHIFT_MIN_BUFFER = 100
+STATS_STD_EPS = 1e-8
 
 
 def to_float(value: Any, default: float = 0.0) -> float:
@@ -70,6 +72,15 @@ def compact_reason(text: str, limit: int = 160) -> str:
     if len(value) <= limit:
         return value
     return f"{value[: max(0, limit - 3)]}..."
+
+
+def mask_secret(value: str | None, prefix: int = 7, suffix: int = 4) -> str:
+    if not value:
+        return ""
+    text = str(value)
+    if len(text) <= prefix + suffix:
+        return "*" * len(text)
+    return f"{text[:prefix]}...{text[-suffix:]}"
 
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -141,20 +152,47 @@ class EntityStatePreprocessor:
         return cleaned_features, context_vector
 
 
-class DynamicThreshold:
+class RollingStatsBuffer:
     def __init__(self, buffer_size: int, percentile: float, min_buffer: int) -> None:
         self.buffer = deque(maxlen=max(1, int(buffer_size)))
         self.percentile = float(percentile)
         self.min_buffer = max(1, int(min_buffer))
 
-    def current_threshold(self) -> float | None:
+    def summary(self) -> dict[str, float] | None:
         if len(self.buffer) < self.min_buffer:
             return None
         scores = np.asarray(self.buffer, dtype=np.float32)
-        return float(np.percentile(scores, self.percentile))
+        return {
+            "min": float(np.min(scores)),
+            "max": float(np.max(scores)),
+            "mean": float(np.mean(scores)),
+            "std": float(np.std(scores)),
+            "percentile_threshold": float(np.percentile(scores, self.percentile)),
+        }
+
+    def current_threshold(self) -> float | None:
+        stats = self.summary()
+        if stats is None:
+            return None
+        return float(stats["percentile_threshold"])
+
+    def z_score(self, value: float) -> float | None:
+        stats = self.summary()
+        if stats is None:
+            return None
+        std = float(stats["std"])
+        if std <= STATS_STD_EPS:
+            return 0.0
+        return float((float(value) - float(stats["mean"])) / std)
 
     def observe(self, score: float) -> None:
         self.buffer.append(float(score))
+
+
+@dataclass
+class EntityAdaptiveState:
+    score_buffer: RollingStatsBuffer
+    feature_error_buffers: dict[str, RollingStatsBuffer]
 
 
 @dataclass
@@ -355,17 +393,12 @@ class DirectPrometheusAnomalyRunner:
             evaluation_dir=(config.results_dir / config.model_dir.name).resolve(),
             output_dir=(config.results_dir / config.model_dir.name).resolve(),
         )
-        self.gpt_prompt = load_prompt_template(self.gpt_config.prompt_template_path)
         self.gpt_unavailable_reason: str | None = None
         self.openai_client = self._build_openai_client()
         self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
         self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
         self.telegram_enabled = bool(self.telegram_bot_token and self.telegram_chat_id)
-        self.dynamic_threshold = DynamicThreshold(
-            buffer_size=DYNAMIC_THRESHOLD_BUFFER_SIZE,
-            percentile=DYNAMIC_THRESHOLD_PERCENTILE,
-            min_buffer=DYNAMIC_THRESHOLD_MIN_BUFFER,
-        )
+        self.entity_adaptive_state: dict[str, EntityAdaptiveState] = {}
         self.last_notified_at: dict[str, int] = {}
         self.last_skip_logged_at: dict[tuple[str, str], int] = {}
         self.ready_window_counts: dict[str, int] = {}
@@ -379,6 +412,8 @@ class DirectPrometheusAnomalyRunner:
         if not DOTENV_AVAILABLE:
             print("[WARN] python-dotenv is not installed. .env loading may be skipped.")
         print(f"OPENAI_API_KEY loaded: {bool(os.getenv('OPENAI_API_KEY'))}")
+        if os.getenv("OPENAI_API_KEY"):
+            print(f"OPENAI_API_KEY masked: {mask_secret(os.getenv('OPENAI_API_KEY'))}")
         print(f"TELEGRAM_BOT_TOKEN loaded: {bool(self.telegram_bot_token)}")
         print(f"TELEGRAM_CHAT_ID loaded: {bool(self.telegram_chat_id)}")
 
@@ -391,6 +426,42 @@ class DirectPrometheusAnomalyRunner:
 
         if not self.telegram_enabled:
             print("[WARN] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing. Telegram alerts are disabled.")
+
+    def _new_score_buffer(self) -> RollingStatsBuffer:
+        return RollingStatsBuffer(
+            buffer_size=ROLLING_SCORE_BUFFER_SIZE,
+            percentile=ROLLING_SCORE_PERCENTILE,
+            min_buffer=ROLLING_SCORE_MIN_BUFFER,
+        )
+
+    def _new_feature_error_buffer(self) -> RollingStatsBuffer:
+        return RollingStatsBuffer(
+            buffer_size=ROLLING_SCORE_BUFFER_SIZE,
+            percentile=ROLLING_SCORE_PERCENTILE,
+            min_buffer=FEATURE_SHIFT_MIN_BUFFER,
+        )
+
+    def get_entity_adaptive_state(self, entity_id: str) -> EntityAdaptiveState:
+        state = self.entity_adaptive_state.get(entity_id)
+        if state is None:
+            state = EntityAdaptiveState(
+                score_buffer=self._new_score_buffer(),
+                feature_error_buffers={},
+            )
+            self.entity_adaptive_state[entity_id] = state
+        return state
+
+    def get_feature_error_buffer(
+        self,
+        entity_id: str,
+        feature_name: str,
+    ) -> RollingStatsBuffer:
+        state = self.get_entity_adaptive_state(entity_id)
+        buffer = state.feature_error_buffers.get(feature_name)
+        if buffer is None:
+            buffer = self._new_feature_error_buffer()
+            state.feature_error_buffers[feature_name] = buffer
+        return buffer
 
     def _build_openai_client(self) -> Any | None:
         api_key = os.getenv("OPENAI_API_KEY")
@@ -653,6 +724,44 @@ class DirectPrometheusAnomalyRunner:
 
         return store
 
+    def evaluate_feature_shift(
+        self,
+        entity_id: str,
+        top_k_features: list[str],
+        top_k_feature_errors: list[float],
+    ) -> tuple[bool, str | None]:
+        if not ENABLE_FEATURE_SHIFT_CANDIDATE:
+            return False, None
+        if not top_k_features or not top_k_feature_errors:
+            return False, None
+
+        top_feature = str(top_k_features[0])
+        top_error = float(top_k_feature_errors[0])
+        buffer = self.get_feature_error_buffer(entity_id, top_feature)
+        stats = buffer.summary()
+        if stats is None:
+            return False, None
+
+        percentile_threshold = float(stats["percentile_threshold"])
+        if top_error > percentile_threshold:
+            return True, f"feature_shift:{top_feature}>p{ROLLING_SCORE_PERCENTILE:.0f}"
+
+        std = float(stats["std"])
+        if std > STATS_STD_EPS:
+            z_score = (top_error - float(stats["mean"])) / std
+            if z_score > FEATURE_SHIFT_ZSCORE_THRESHOLD:
+                return True, f"feature_shift:{top_feature}_z>{FEATURE_SHIFT_ZSCORE_THRESHOLD:.1f}"
+
+        return False, None
+
+    def observe_feature_errors(
+        self,
+        entity_id: str,
+        feature_error_vector: list[float],
+    ) -> None:
+        for feature_name, feature_error in zip(self.bundle["feature_columns"], feature_error_vector):
+            self.get_feature_error_buffer(entity_id, feature_name).observe(float(feature_error))
+
     def process_entity(
         self,
         entity: dict[str, Any],
@@ -737,23 +846,57 @@ class DirectPrometheusAnomalyRunner:
 
         self.ready_window_counts[entity_id] = window_id + 1
         anomaly_score = float(result.anomaly_score or 0.0)
-        dynamic_threshold = self.dynamic_threshold.current_threshold()
+        top_k_features = [str(value) for value in (result.top_k_features or [])]
+        top_k_feature_errors = [float(value) for value in (result.top_k_feature_errors or [])]
+        feature_error_vector = [float(value) for value in (result.feature_error_vector or [])]
+
+        adaptive_state = self.get_entity_adaptive_state(entity_id)
+        score_stats = adaptive_state.score_buffer.summary()
+        dynamic_threshold = None if score_stats is None else float(score_stats["percentile_threshold"])
         final_threshold = max(fixed_threshold, dynamic_threshold) if dynamic_threshold is not None else fixed_threshold
-        predicted_label = int(anomaly_score > final_threshold)
-        self.dynamic_threshold.observe(anomaly_score)
+        z_score = adaptive_state.score_buffer.z_score(anomaly_score) if ENABLE_ZSCORE_CANDIDATE else None
+        score_threshold_hit = anomaly_score > final_threshold
+        z_score_hit = bool(z_score is not None and z_score > ZSCORE_THRESHOLD)
+        significant_feature_shift, feature_shift_reason = self.evaluate_feature_shift(
+            entity_id=entity_id,
+            top_k_features=top_k_features,
+            top_k_feature_errors=top_k_feature_errors,
+        )
+
+        decision_reasons: list[str] = []
+        if score_threshold_hit:
+            decision_reasons.append("score_above_threshold")
+        if z_score_hit:
+            decision_reasons.append(f"z_score>{ZSCORE_THRESHOLD:.1f}")
+        if significant_feature_shift and feature_shift_reason:
+            decision_reasons.append(feature_shift_reason)
+
+        anomaly_candidate = bool(score_threshold_hit or z_score_hit or significant_feature_shift)
+        decision_reason = ",".join(decision_reasons) if decision_reasons else "below_all_candidate_rules"
+
+        adaptive_state.score_buffer.observe(anomaly_score)
+        self.observe_feature_errors(entity_id, feature_error_vector)
         response.update(
             {
-                "status": "anomaly" if predicted_label == 1 else "normal",
-                "predicted_label": predicted_label,
+                "status": "candidate" if anomaly_candidate else "normal",
+                "predicted_label": int(anomaly_candidate),
+                "anomaly_candidate": bool(anomaly_candidate),
                 "anomaly_score": anomaly_score,
                 "threshold": final_threshold,
                 "fixed_threshold": fixed_threshold,
                 "dynamic_threshold": dynamic_threshold,
                 "final_threshold": final_threshold,
                 "score_over_threshold": anomaly_score - final_threshold,
-                "top_k_features": result.top_k_features or [],
-                "top_k_feature_errors": result.top_k_feature_errors or [],
-                "feature_error_vector": result.feature_error_vector or [],
+                "z_score": z_score,
+                "significant_feature_shift": bool(significant_feature_shift),
+                "decision_reason": decision_reason,
+                "top_k_features": top_k_features,
+                "top_k_feature_errors": top_k_feature_errors,
+                "feature_error_vector": feature_error_vector,
+                "rolling_score_min": None if score_stats is None else float(score_stats["min"]),
+                "rolling_score_max": None if score_stats is None else float(score_stats["max"]),
+                "rolling_score_mean": None if score_stats is None else float(score_stats["mean"]),
+                "rolling_score_percentile_threshold": None if score_stats is None else float(score_stats["percentile_threshold"]),
                 "metadata": result.metadata or {},
             }
         )
@@ -761,76 +904,15 @@ class DirectPrometheusAnomalyRunner:
         return response
 
     def adjudicate_with_gpt(self, candidate: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
-        if self.openai_client is None:
-            return None, self.gpt_unavailable_reason or "gpt_unavailable"
+        decision = adjudicate_anomaly(candidate, config=self.gpt_config)
+        if not bool(decision.get("used_fallback", False)):
+            return decision, None
 
-        summary = build_window_summary(candidate)
-        try:
-            response = self.openai_client.responses.create(
-                model=self.gpt_config.model,
-                instructions=self.gpt_prompt,
-                input=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": json.dumps(summary, ensure_ascii=True),
-                            }
-                        ],
-                    }
-                ],
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": "container_anomaly_decision",
-                        "schema": RESPONSE_JSON_SCHEMA,
-                        "strict": True,
-                    }
-                },
-            )
-        except Exception as exc:
-            return None, f"openai_request_failed:{compact_reason(str(exc), limit=120)}"
-
-        response_text = getattr(response, "output_text", "")
-        if not response_text:
-            return None, "empty_response_text"
-
-        try:
-            decision = json.loads(response_text)
-        except json.JSONDecodeError:
-            return None, "invalid_json_response"
-
-        normalized = {
-            "label": str(decision.get("label", "")).strip().lower(),
-            "severity": str(decision.get("severity", "")).strip().lower(),
-            "explanation": str(decision.get("explanation", "")).strip(),
-            "recommended_action": str(decision.get("recommended_action", "")).strip(),
-        }
-        if normalized["label"] not in VALID_LABELS:
-            return None, "invalid_gpt_label"
-        if normalized["severity"] not in VALID_SEVERITIES:
-            return None, "invalid_gpt_severity"
-        if normalized["recommended_action"] not in RECOMMENDED_ACTIONS:
-            return None, "invalid_gpt_recommended_action"
-        if not normalized["explanation"]:
-            return None, "empty_gpt_explanation"
-
-        return (
-            {
-                **candidate,
-                "gpt_input_summary": summary,
-                "structured_json": normalized,
-                "label": normalized["label"],
-                "severity": normalized["severity"],
-                "explanation": normalized["explanation"],
-                "recommended_action": normalized["recommended_action"],
-                "used_fallback": False,
-                "gpt_model": self.gpt_config.model,
-                "response_id": getattr(response, "id", None),
-            },
-            None,
-        )
+        call_reason = str(decision.get("call_reason", "") or self.gpt_unavailable_reason or "gpt_unavailable")
+        call_error = str(decision.get("call_error", "") or "").strip()
+        if call_error:
+            return None, f"{call_reason}:{compact_reason(call_error, limit=120)}"
+        return None, call_reason
 
     def in_cooldown(self, entity_id: str, time_stamp: int) -> tuple[bool, int]:
         last_sent = self.last_notified_at.get(entity_id)
@@ -841,50 +923,49 @@ class DirectPrometheusAnomalyRunner:
             return False, 0
         return True, int(self.config.cooldown_seconds - elapsed)
 
-    def format_telegram_alert(self, decision: dict[str, Any]) -> str:
-        top_features = decision.get("top_k_features", [])
-        top_text = ", ".join(str(value) for value in top_features[:5]) if top_features else "n/a"
-        lines = [
-            "Live container anomaly alert",
-            f"Entity: {decision.get('entity_id', 'unknown')}",
-            f"Container: {decision.get('container_id', 'unknown')}",
-            f"Machine: {decision.get('machine_id', 'unknown')}",
-            f"Anomaly score: {float(decision.get('anomaly_score', 0.0)):.6f}",
-            f"Threshold: {float(decision.get('threshold', 0.0)):.6f}",
-            f"Top features: {top_text}",
-            f"GPT label: {decision.get('label', 'unknown')}",
-            f"GPT severity: {decision.get('severity', 'unknown')}",
-            f"Explanation: {decision.get('explanation', '')}",
-            f"Recommended action: {decision.get('recommended_action', '')}",
-        ]
-        return "\n".join(lines)
+    def build_gpt_failure_telegram_payload(
+        self,
+        result: dict[str, Any],
+        gpt_error: str,
+    ) -> dict[str, Any]:
+        return {
+            **result,
+            "gpt_failed": True,
+            "gpt_failure_reason": str(gpt_error),
+            "label": "model_candidate",
+            "severity": "unknown",
+            "explanation": "",
+            "model_explanation": (
+                "FiLM autoencoder flagged this window before GPT adjudication. "
+                f"Candidate rule: {result.get('decision_reason', 'unknown')}"
+            ),
+            "recommended_action": (
+                "Review container metrics manually and fix GPT quota or API availability "
+                "before relying on GPT adjudication."
+            ),
+        }
 
     def send_telegram_alert(self, decision: dict[str, Any]) -> tuple[bool, str | None]:
         if not self.telegram_enabled:
             return False, "missing_telegram_credentials"
 
-        message_text = self.format_telegram_alert(decision)
-        endpoint = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+        message_text = format_telegram_alert(decision)
         try:
-            response = requests.post(
-                endpoint,
-                json={
-                    "chat_id": self.telegram_chat_id,
-                    "text": message_text,
-                    "disable_web_page_preview": True,
-                },
-                timeout=max(1, int(self.config.request_timeout)),
+            sent, body, error = send_telegram_message(
+                bot_token=str(self.telegram_bot_token),
+                chat_id=str(self.telegram_chat_id),
+                message_text=message_text,
+                timeout_seconds=int(self.config.request_timeout),
             )
-            response.raise_for_status()
-            body = response.json()
-            if not body.get("ok", False):
+            if not sent:
+                error_text = compact_reason(str(error or "telegram_send_failed"), limit=120)
                 self.log_telegram_message(
                     decision=decision,
                     message_text=message_text,
                     sent=False,
-                    error=f"telegram_send_failed:{body.get('description', 'unknown_error')}",
+                    error=error_text,
                 )
-                return False, f"telegram_send_failed:{body.get('description', 'unknown_error')}"
+                return False, error_text
             self.log_telegram_message(
                 decision=decision,
                 message_text=message_text,
@@ -932,6 +1013,10 @@ class DirectPrometheusAnomalyRunner:
             "severity": decision.get("severity"),
             "explanation": decision.get("explanation"),
             "recommended_action": decision.get("recommended_action"),
+            "gpt_failed": decision.get("gpt_failed", False),
+            "gpt_failure_reason": decision.get("gpt_failure_reason"),
+            "call_reason": decision.get("call_reason"),
+            "call_error": decision.get("call_error"),
             "structured_json": decision.get("structured_json"),
             "gpt_input_summary": decision.get("gpt_input_summary"),
         }
@@ -968,6 +1053,14 @@ class DirectPrometheusAnomalyRunner:
             "fixed_threshold": window_result.get("fixed_threshold"),
             "dynamic_threshold": window_result.get("dynamic_threshold"),
             "final_threshold": window_result.get("final_threshold"),
+            "z_score": window_result.get("z_score"),
+            "top_k_features": window_result.get("top_k_features", []),
+            "top_k_feature_errors": window_result.get("top_k_feature_errors", []),
+            "rolling_score_min": window_result.get("rolling_score_min"),
+            "rolling_score_max": window_result.get("rolling_score_max"),
+            "rolling_score_mean": window_result.get("rolling_score_mean"),
+            "rolling_score_percentile_threshold": window_result.get("rolling_score_percentile_threshold"),
+            "decision_reason": window_result.get("decision_reason"),
             "decision": window_result.get("status"),
         }
         append_jsonl(self.threshold_log_path, payload)
@@ -994,13 +1087,51 @@ class DirectPrometheusAnomalyRunner:
         entity_id = str(result["entity_id"])
 
         if int(result.get("predicted_label", 0)) != 1:
-            print(f"[NORMAL] {entity_id} | score={float(result.get('anomaly_score', 0.0)):.6f}")
+            print(
+                f"[NORMAL] {entity_id} | "
+                f"score={float(result.get('anomaly_score', 0.0)):.6f} | "
+                f"final_threshold={float(result.get('final_threshold', 0.0)):.6f}"
+            )
             return
+
+        dynamic_display = result.get("dynamic_threshold")
+        if dynamic_display is None:
+            dynamic_display = result.get("fixed_threshold", 0.0)
+        print(
+            f"[CANDIDATE] {entity_id} | "
+            f"score={float(result.get('anomaly_score', 0.0)):.6f} | "
+            f"static={float(result.get('fixed_threshold', 0.0)):.6f} | "
+            f"dynamic={float(dynamic_display or 0.0):.6f} | "
+            f"z={float(result.get('z_score', 0.0) or 0.0):.3f} | "
+            f"reason={result.get('decision_reason', 'unknown')}"
+        )
 
         decision, gpt_error = self.adjudicate_with_gpt(result)
         if decision is None:
-            if self.should_print_skip(entity_id, str(gpt_error), time_stamp):
-                print(f"[SKIP] {entity_id} | reason={gpt_error}")
+            fallback_decision = self.build_gpt_failure_telegram_payload(result, str(gpt_error))
+            self.log_gpt_response(fallback_decision, status="gpt_failed_fallback")
+
+            cooldown_active, remaining = self.in_cooldown(entity_id, time_stamp)
+            if cooldown_active:
+                reason = f"cooldown_active:{remaining}s_remaining"
+                if self.should_print_skip(entity_id, reason, time_stamp):
+                    print(f"[SKIP] {entity_id} | reason={reason}")
+                if ENABLE_GPT_LOGGING:
+                    self.log_gpt_decision(fallback_decision, telegram_sent=False)
+                return
+
+            sent, telegram_error = self.send_telegram_alert(fallback_decision)
+            if sent:
+                self.last_notified_at[entity_id] = int(time_stamp)
+                print(f"[TELEGRAM] {entity_id} | sent | gpt_failed={gpt_error}")
+                if ENABLE_GPT_LOGGING:
+                    self.log_gpt_decision(fallback_decision, telegram_sent=True)
+                return
+
+            if self.should_print_skip(entity_id, str(telegram_error), time_stamp):
+                print(f"[SKIP] {entity_id} | reason={telegram_error}")
+            if ENABLE_GPT_LOGGING:
+                self.log_gpt_decision(fallback_decision, telegram_sent=False)
             return
 
         if str(decision["label"]).strip().lower() == "normal":
@@ -1076,9 +1207,11 @@ class DirectPrometheusAnomalyRunner:
         print(f"Threshold log: {self.threshold_log_path}")
         print(
             "Adaptive threshold: "
-            f"buffer={DYNAMIC_THRESHOLD_BUFFER_SIZE}, "
-            f"percentile={DYNAMIC_THRESHOLD_PERCENTILE}, "
-            f"min_buffer={DYNAMIC_THRESHOLD_MIN_BUFFER}"
+            f"buffer={ROLLING_SCORE_BUFFER_SIZE}, "
+            f"percentile={ROLLING_SCORE_PERCENTILE}, "
+            f"min_buffer={ROLLING_SCORE_MIN_BUFFER}, "
+            f"zscore={ENABLE_ZSCORE_CANDIDATE}, "
+            f"feature_shift={ENABLE_FEATURE_SHIFT_CANDIDATE}"
         )
         print(f"Interval  : {self.config.poll_interval}s")
         while True:

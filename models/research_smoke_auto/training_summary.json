@@ -4,19 +4,19 @@
   "loss_curve_path": "C:\\Users\\kaspe\\Desktop\\Project\\project\\results\\loss_curve.png",
   "model_path": "C:\\Users\\kaspe\\Desktop\\Project\\project\\models\\research_smoke_auto\\film_ae.pt",
   "detector_meta": {
-    "threshold": 4.4031548500061035,
+    "threshold": 4.342864990234375,
     "threshold_quantile": 0.995,
     "window_size": 30,
     "n_features": 8,
     "context_dim": 17,
     "score_mode": "mean_feature_mse",
-    "num_train_windows": 1394481,
-    "num_val_windows": 154942,
-    "num_test_windows": 392681,
-    "best_val_loss": 0.44475893890678353,
-    "val_score_mean": 0.44475892186164856,
-    "val_score_std": 0.6830311417579651,
-    "test_split_rows": 392681
+    "num_train_windows": 139011,
+    "num_val_windows": 15446,
+    "num_test_windows": 39160,
+    "best_val_loss": 0.5564422328172224,
+    "val_score_mean": 0.5564422011375427,
+    "val_score_std": 0.727505087852478,
+    "test_split_rows": 39160
   },
   "train_config": {
     "dataset_dir": "C:\\Users\\kaspe\\Desktop\\Project\\project\\data\\research_processed_smoke_auto",
@@ -36,7 +36,7 @@
     "score_mode": "mean_feature_mse",
     "device": "cuda"
   },
-  "train_split_rows": 1394481,
-  "val_split_rows": 154942,
-  "test_split_rows": 392681
+  "train_split_rows": 139011,
+  "val_split_rows": 15446,
+  "test_split_rows": 39160
 }

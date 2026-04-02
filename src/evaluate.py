@@ -4,19 +4,21 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 import json
+from time import perf_counter
 from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
-import requests
 from sklearn.metrics import average_precision_score, precision_recall_fscore_support, roc_auc_score
 import torch
+from tqdm.auto import tqdm
 
 try:
     from config import EvalConfig, GPTConfig
     from gpt_adjudicator import adjudicate_anomaly, build_window_summary, compare_ae_vs_gpt_decisions
     from model import build_model_from_checkpoint
+    from telegram_utils import format_telegram_alert, send_telegram_message
     from utils import (
         apply_3d_scaler,
         build_prediction_frame,
@@ -31,6 +33,7 @@ except ImportError:
     from .config import EvalConfig, GPTConfig
     from .gpt_adjudicator import adjudicate_anomaly, build_window_summary, compare_ae_vs_gpt_decisions
     from .model import build_model_from_checkpoint
+    from .telegram_utils import format_telegram_alert, send_telegram_message
     from .utils import (
         apply_3d_scaler,
         build_prediction_frame,
@@ -41,6 +44,11 @@ except ImportError:
         safe_literal_list,
         write_json,
     )
+
+
+def _eval_log(message: str, enabled: bool) -> None:
+    if enabled:
+        tqdm.write(f"[evaluate] {message}")
 
 
 def load_artifacts(
@@ -129,15 +137,27 @@ def reconstruct_windows(
     c_array: np.ndarray,
     batch_size: int,
     device: torch.device,
+    show_progress: bool = True,
 ) -> np.ndarray:
     predictions: list[np.ndarray] = []
+    total_batches = max(1, (len(x_array) + batch_size - 1) // batch_size)
+    progress = tqdm(
+        range(0, len(x_array), batch_size),
+        total=total_batches,
+        desc="Reconstructing windows",
+        unit="batch",
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
     model.eval()
     with torch.no_grad():
-        for start in range(0, len(x_array), batch_size):
+        for start in progress:
             end = start + batch_size
             x_batch = torch.as_tensor(x_array[start:end], dtype=torch.float32, device=device)
             c_batch = torch.as_tensor(c_array[start:end], dtype=torch.float32, device=device)
             predictions.append(model(x_batch, c_batch).cpu().numpy())
+            progress.set_postfix(windows=min(end, len(x_array)))
+    progress.close()
     return np.concatenate(predictions, axis=0)
 
 
@@ -319,12 +339,21 @@ def extract_compact_alert_payload(record: pd.Series | dict[str, Any]) -> dict[st
 def run_streaming_inference_flow(
     prediction_frame: pd.DataFrame,
     gpt_config: GPTConfig | None = None,
+    show_progress: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     realtime_stream = build_realtime_alert_candidates(prediction_frame)
     stream_rows: list[dict[str, Any]] = []
     gpt_rows: list[dict[str, Any]] = []
+    progress = tqdm(
+        realtime_stream.iterrows(),
+        total=len(realtime_stream),
+        desc="Streaming inference",
+        unit="window",
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
 
-    for _, row in realtime_stream.iterrows():
+    for _, row in progress:
         record = row.to_dict()
         payload = extract_compact_alert_payload(record)
         summary = build_window_summary(payload)
@@ -353,7 +382,9 @@ def run_streaming_inference_flow(
             )
 
         stream_rows.append(stream_row)
+        progress.set_postfix(gpt=len(gpt_rows))
 
+    progress.close()
     stream_df = pd.DataFrame(stream_rows)
     gpt_df = pd.DataFrame(gpt_rows)
     comparison_df = compare_ae_vs_gpt_decisions(gpt_df)
@@ -364,51 +395,10 @@ def json_dumps(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=True)
 
 
-def build_notification_reason(record: dict[str, Any]) -> str:
-    gpt_reason = str(record.get("gpt_explanation", "") or "").strip()
-    if gpt_reason:
-        return gpt_reason
-
-    top_features = safe_literal_list(record.get("top_k_features", []))
-    top_text = ", ".join(str(value) for value in top_features[:3]) if top_features else "no dominant features"
-    score = float(record.get("anomaly_score", 0.0))
-    threshold = float(record.get("threshold", 0.0))
-    return (
-        f"Threshold-crossing anomaly candidate with score {score:.3f} "
-        f"against threshold {threshold:.3f}. Top features: {top_text}."
-    )
-
-
-def format_telegram_alert(record: dict[str, Any]) -> str:
-    top_features = safe_literal_list(record.get("top_k_features", []))
-    top_text = ", ".join(str(value) for value in top_features[:3]) if top_features else "n/a"
-    lines = [
-        "Critical container anomaly alert",
-        f"Window: {int(record.get('window_id', -1))}",
-        f"Container: {record.get('container_id', 'unknown')}",
-        f"Machine: {record.get('machine_id', 'unknown')}",
-        f"Split: {record.get('split', '')}",
-        f"Score: {float(record.get('anomaly_score', 0.0)):.3f}",
-        f"Threshold: {float(record.get('threshold', 0.0)):.3f}",
-        f"Top features: {top_text}",
-    ]
-
-    gpt_label = str(record.get("gpt_label", "") or "").strip()
-    gpt_severity = str(record.get("gpt_severity", "") or "").strip()
-    gpt_action = str(record.get("gpt_recommended_action", "") or "").strip()
-    if gpt_label:
-        lines.append(f"GPT label: {gpt_label}")
-    if gpt_severity:
-        lines.append(f"GPT severity: {gpt_severity}")
-    if gpt_action:
-        lines.append(f"Action: {gpt_action}")
-    lines.append(f"Reason: {build_notification_reason(record)}")
-    return "\n".join(lines)
-
-
 def send_telegram_notifications(
     alerts: pd.DataFrame,
     config: EvalConfig,
+    show_progress: bool = True,
 ) -> dict[str, Any]:
     report = {
         "enabled": bool(config.telegram_enabled),
@@ -460,24 +450,27 @@ def send_telegram_notifications(
         report["reason"] = "no_matching_alerts"
         return report
 
-    endpoint = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    for _, row in selected_alerts.iterrows():
+    progress = tqdm(
+        selected_alerts.iterrows(),
+        total=len(selected_alerts),
+        desc="Sending Telegram alerts",
+        unit="alert",
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
+
+    for _, row in progress:
         record = row.to_dict()
         report["attempted"] += 1
         try:
-            response = requests.post(
-                endpoint,
-                json={
-                    "chat_id": chat_id,
-                    "text": format_telegram_alert(record),
-                    "disable_web_page_preview": True,
-                },
-                timeout=max(1, int(config.telegram_timeout_seconds)),
+            sent, body, error = send_telegram_message(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                message_text=format_telegram_alert(record),
+                timeout_seconds=int(config.telegram_timeout_seconds),
             )
-            response.raise_for_status()
-            body = response.json()
-            if not body.get("ok", False):
-                raise RuntimeError(body.get("description", "telegram_send_failed"))
+            if not sent:
+                raise RuntimeError(error or "telegram_send_failed")
             report["sent"] += 1
             report["records"].append(
                 {
@@ -495,6 +488,8 @@ def send_telegram_notifications(
                     "error": str(exc),
                 }
             )
+        progress.set_postfix(sent=report["sent"], failed=report["failed"])
+    progress.close()
     return report
 
 
@@ -503,10 +498,20 @@ def evaluate_model(
     gpt_config: GPTConfig | None = None,
 ) -> dict[str, Any]:
     config = config or EvalConfig()
+    started_at = perf_counter()
     if config.include_gpt_in_stream and gpt_config is None:
         gpt_config = GPTConfig(output_dir=config.output_dir, evaluation_dir=config.output_dir)
 
     output_dir = ensure_directory(config.output_dir)
+    resolved_device = choose_device(config.device)
+    _eval_log(
+        (
+            f"Starting evaluation: split={config.split}, device={resolved_device}, "
+            f"synthetic_injection={config.use_synthetic_injection}, "
+            f"gpt_stream={config.include_gpt_in_stream}, telegram={config.telegram_enabled}"
+        ),
+        enabled=config.verbose,
+    )
 
     bundle = load_artifacts(config.dataset_dir, config.model_dir)
     if "X_test" in bundle:
@@ -526,11 +531,17 @@ def evaluate_model(
     else:
         x_split, c_split, metadata = select_split(bundle["X"], bundle["C"], bundle["metadata"], config.split)
     feature_names = bundle["feature_meta"]["feature_columns"]
+    _eval_log(
+        f"Loaded split with {len(metadata)} windows and {len(feature_names)} features.",
+        enabled=config.verbose,
+    )
 
+    _eval_log("Scaling input features and context vectors.", enabled=config.verbose)
     x_scaled = apply_3d_scaler(bundle["x_scaler"], x_split)
     c_scaled = bundle["c_scaler"].transform(c_split).astype(np.float32)
 
     if config.use_synthetic_injection:
+        _eval_log("Injecting synthetic anomalies into evaluation windows.", enabled=config.verbose)
         x_eval, labels, event_ids, event_table = inject_synthetic_anomalies(
             x_scaled=x_scaled,
             metadata=metadata,
@@ -547,7 +558,8 @@ def evaluate_model(
         event_ids = np.full(len(x_scaled), -1, dtype=np.int32)
         event_table = pd.DataFrame(columns=["event_id"])
 
-    device = torch.device(choose_device(config.device))
+    device = torch.device(resolved_device)
+    _eval_log("Running model reconstruction.", enabled=config.verbose)
     model = build_model_from_checkpoint(bundle["checkpoint"], device=device)
     predictions = reconstruct_windows(
         model=model,
@@ -555,8 +567,10 @@ def evaluate_model(
         c_array=c_scaled,
         batch_size=config.batch_size,
         device=device,
+        show_progress=config.show_progress,
     )
 
+    _eval_log("Computing anomaly scores and threshold decisions.", enabled=config.verbose)
     feature_errors = compute_feature_error_matrix(x_eval, predictions)
     scores = compute_window_scores(feature_errors)
     threshold = float(bundle["detector_meta"]["threshold"])
@@ -574,9 +588,11 @@ def evaluate_model(
     )
     prediction_frame["event_id"] = event_ids.astype(int)
 
+    _eval_log("Simulating realtime stream and optional GPT adjudication.", enabled=config.verbose)
     stream_df, gpt_df, comparison_df = run_streaming_inference_flow(
         prediction_frame=prediction_frame,
         gpt_config=gpt_config if config.include_gpt_in_stream else None,
+        show_progress=config.show_progress,
     )
     realtime_alerts = stream_df[stream_df["alert_ready"]].copy()
 
@@ -596,6 +612,13 @@ def evaluate_model(
         "num_gpt_decisions": int(len(gpt_df)),
         "split": config.split,
     }
+    _eval_log(
+        (
+            f"Detected {int(predicted_labels.sum())} anomalous windows at threshold {threshold:.6f}. "
+            f"Realtime alerts={len(realtime_alerts)}, GPT decisions={len(gpt_df)}."
+        ),
+        enabled=config.verbose,
+    )
 
     prediction_csv_path = output_dir / "window_level_predictions.csv"
     top_windows_path = output_dir / "top_anomalous_windows.csv"
@@ -620,11 +643,26 @@ def evaluate_model(
         comparison_df.to_csv(comparison_csv_path, index=False)
         write_json(comparison_json_path, {"records": comparison_df.to_dict(orient="records")})
 
-    telegram_report = send_telegram_notifications(realtime_alerts, config=config)
+    if config.telegram_enabled:
+        _eval_log("Sending Telegram notifications for selected alerts.", enabled=config.verbose)
+    telegram_report = send_telegram_notifications(
+        realtime_alerts,
+        config=config,
+        show_progress=config.show_progress,
+    )
     write_json(telegram_report_path, telegram_report)
     evaluation_summary["telegram_notifications_sent"] = int(telegram_report["sent"])
     evaluation_summary["telegram_notifications_failed"] = int(telegram_report["failed"])
     write_json(summary_path, evaluation_summary)
+    elapsed_seconds = perf_counter() - started_at
+    _eval_log(
+        (
+            f"Completed in {elapsed_seconds:.1f}s. "
+            f"F1={evaluation_summary['f1']:.4f}, PR-AUC={evaluation_summary['pr_auc']:.4f}, "
+            f"ROC-AUC={evaluation_summary['roc_auc']:.4f}."
+        ),
+        enabled=config.verbose,
+    )
 
     return {
         "prediction_csv": str(prediction_csv_path.resolve()),
