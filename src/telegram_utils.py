@@ -56,10 +56,34 @@ def format_telegram_alert(record: dict[str, Any]) -> str:
             f"Threshold: {float(record.get('threshold', 0.0)):.6f}",
         ]
     )
+    static_threshold = record.get(
+        "static_threshold",
+        record.get("fallback_threshold", record.get("fixed_threshold")),
+    )
+    if static_threshold is not None:
+        lines.append(f"Static threshold: {float(static_threshold):.6f}")
+    if record.get("dynamic_threshold") is not None:
+        lines.append(f"Dynamic threshold: {float(record.get('dynamic_threshold', 0.0)):.6f}")
+    if record.get("final_threshold") is not None:
+        lines.append(f"Final threshold: {float(record.get('final_threshold', 0.0)):.6f}")
+    threshold_mode = _first_nonempty(record, ["threshold_mode"])
+    if threshold_mode:
+        lines.append(f"Threshold mode: {threshold_mode}")
+    if record.get("score_buffer_size") is not None:
+        lines.append(f"Score buffer size: {int(record.get('score_buffer_size', 0))}")
+    z_score = record.get("z_score")
+    z_reason = _first_nonempty(record, ["z_score_reason"])
+    if z_score is not None:
+        lines.append(f"Z-score: {float(z_score):.3f}")
+    elif z_reason:
+        lines.append(f"Z-score: n/a ({z_reason})")
 
     decision_reason = str(record.get("decision_reason", "") or "").strip()
     if decision_reason:
         lines.append(f"Decision reason: {decision_reason}")
+    alert_suppressed_reason = _first_nonempty(record, ["alert_suppressed_reason"])
+    if alert_suppressed_reason:
+        lines.append(f"Alert status: suppressed ({alert_suppressed_reason})")
     lines.extend(
         [
             f"Top features: {top_text}",

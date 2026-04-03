@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import importlib.util
 import json
 import os
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +42,10 @@ from telegram_utils import format_telegram_alert, send_telegram_message
 from utils import choose_device, ensure_directory
 
 ENABLE_GPT_LOGGING = True
-TELEGRAM_SEND_ALL_RESULTS = True
+TELEGRAM_NOTIFICATIONS_ENABLED = True
+TELEGRAM_STARTUP_TEST_ENABLED = True
+TELEGRAM_STARTUP_TEST_MESSAGE = "DevOps Alert Bot startup test: Telegram notifications are working."
+TELEGRAM_SEND_ALL_RESULTS = False
 TELEGRAM_SKIP_NORMAL_RESULTS = True
 ROLLING_SCORE_BUFFER_SIZE = 500
 ROLLING_SCORE_PERCENTILE = 99.0
@@ -52,6 +56,7 @@ ENABLE_FEATURE_SHIFT_CANDIDATE = True
 FEATURE_SHIFT_ZSCORE_THRESHOLD = 3.0
 FEATURE_SHIFT_MIN_BUFFER = 100
 STATS_STD_EPS = 1e-8
+ADAPTIVE_STATE_DEBUG_LOGS = True
 
 
 def to_float(value: Any, default: float = 0.0) -> float:
@@ -87,6 +92,32 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     ensure_directory(path.parent)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def env_csv(name: str, default: str = "") -> list[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        raw = default
+    return [item.strip() for item in str(raw).split(",") if item.strip()]
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+def format_metric_value(value: Any, precision: int = 6, default: str = "n/a") -> str:
+    if value is None:
+        return default
+    try:
+        return f"{float(value):.{precision}f}"
+    except Exception:
+        return default
 
 
 class CategoryEncoder:
@@ -176,14 +207,17 @@ class RollingStatsBuffer:
             return None
         return float(stats["percentile_threshold"])
 
-    def z_score(self, value: float) -> float | None:
+    def size(self) -> int:
+        return int(len(self.buffer))
+
+    def z_score_details(self, value: float) -> tuple[float | None, str | None]:
         stats = self.summary()
         if stats is None:
-            return None
+            return None, f"warmup<{self.min_buffer}"
         std = float(stats["std"])
         if std <= STATS_STD_EPS:
-            return 0.0
-        return float((float(value) - float(stats["mean"])) / std)
+            return None, "std_too_small"
+        return float((float(value) - float(stats["mean"])) / std), None
 
     def observe(self, score: float) -> None:
         self.buffer.append(float(score))
@@ -193,6 +227,7 @@ class RollingStatsBuffer:
 class EntityAdaptiveState:
     score_buffer: RollingStatsBuffer
     feature_error_buffers: dict[str, RollingStatsBuffer]
+    restored_score_count: int = 0
 
 
 @dataclass
@@ -205,7 +240,19 @@ class RuntimeConfig:
     device: str = "cuda"
     top_k_features: int = 5
     cooldown_seconds: int = 300
+    cooldown_windows: int = field(default_factory=lambda: max(0, env_int("LIVE_ALERT_COOLDOWN_WINDOWS", 3)))
     skip_log_cooldown_seconds: int = 300
+    include_namespaces: list[str] = field(default_factory=lambda: env_csv("LIVE_ALERT_INCLUDE_NAMESPACES"))
+    exclude_namespaces: list[str] = field(
+        default_factory=lambda: env_csv(
+            "LIVE_ALERT_EXCLUDE_NAMESPACES",
+            "kube-system,kube-flannel,monitoring",
+        )
+    )
+    include_pods: list[str] = field(default_factory=lambda: env_csv("LIVE_ALERT_INCLUDE_PODS"))
+    exclude_pods: list[str] = field(default_factory=lambda: env_csv("LIVE_ALERT_EXCLUDE_PODS"))
+    include_containers: list[str] = field(default_factory=lambda: env_csv("LIVE_ALERT_INCLUDE_CONTAINERS"))
+    exclude_containers: list[str] = field(default_factory=lambda: env_csv("LIVE_ALERT_EXCLUDE_CONTAINERS"))
     results_dir: Path = RESULTS_DIR / "live_prometheus"
 
 
@@ -397,9 +444,12 @@ class DirectPrometheusAnomalyRunner:
         self.openai_client = self._build_openai_client()
         self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
         self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        self.telegram_enabled = bool(self.telegram_bot_token and self.telegram_chat_id)
+        self.telegram_enabled = bool(
+            TELEGRAM_NOTIFICATIONS_ENABLED and self.telegram_bot_token and self.telegram_chat_id
+        )
         self.entity_adaptive_state: dict[str, EntityAdaptiveState] = {}
-        self.last_notified_at: dict[str, int] = {}
+        self.entity_state_creation_counts: dict[str, int] = {}
+        self.last_alert_state: dict[str, dict[str, Any]] = {}
         self.last_skip_logged_at: dict[tuple[str, str], int] = {}
         self.ready_window_counts: dict[str, int] = {}
 
@@ -408,6 +458,7 @@ class DirectPrometheusAnomalyRunner:
         self.gpt_response_log_path = log_dir / "live_gpt_responses.jsonl"
         self.telegram_log_path = log_dir / "live_telegram_messages.jsonl"
         self.threshold_log_path = log_dir / "live_threshold_decisions.jsonl"
+        self.restore_score_buffers_from_threshold_log()
 
         if not DOTENV_AVAILABLE:
             print("[WARN] python-dotenv is not installed. .env loading may be skipped.")
@@ -424,8 +475,12 @@ class DirectPrometheusAnomalyRunner:
             self.gpt_unavailable_reason = "openai_package_not_installed"
             print("[WARN] Python package `openai` is not installed in this venv. GPT adjudication and Telegram alerts are disabled.")
 
-        if not self.telegram_enabled:
+        if not TELEGRAM_NOTIFICATIONS_ENABLED:
+            print("[WARN] Telegram notifications are disabled in direct_prometheus_infer.py.")
+        elif not self.telegram_enabled:
             print("[WARN] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing. Telegram alerts are disabled.")
+
+        self.send_startup_telegram_test()
 
     def _new_score_buffer(self) -> RollingStatsBuffer:
         return RollingStatsBuffer(
@@ -441,27 +496,181 @@ class DirectPrometheusAnomalyRunner:
             min_buffer=FEATURE_SHIFT_MIN_BUFFER,
         )
 
-    def get_entity_adaptive_state(self, entity_id: str) -> EntityAdaptiveState:
-        state = self.entity_adaptive_state.get(entity_id)
+    def get_entity_adaptive_state(
+        self,
+        entity_id: str,
+    ) -> tuple[EntityAdaptiveState, bool, bool]:
+        entity_key = str(entity_id)
+        state = self.entity_adaptive_state.get(entity_key)
+        history_already_existed = state is not None
         if state is None:
             state = EntityAdaptiveState(
                 score_buffer=self._new_score_buffer(),
                 feature_error_buffers={},
             )
-            self.entity_adaptive_state[entity_id] = state
-        return state
+            self.entity_adaptive_state[entity_key] = state
+            self.entity_state_creation_counts[entity_key] = self.entity_state_creation_counts.get(entity_key, 0) + 1
+        creation_count = int(self.entity_state_creation_counts.get(entity_key, 1))
+        history_reinitialized = bool(not history_already_existed and creation_count > 1)
+        return state, history_already_existed, history_reinitialized
 
     def get_feature_error_buffer(
         self,
         entity_id: str,
         feature_name: str,
     ) -> RollingStatsBuffer:
-        state = self.get_entity_adaptive_state(entity_id)
+        state, _, _ = self.get_entity_adaptive_state(entity_id)
         buffer = state.feature_error_buffers.get(feature_name)
         if buffer is None:
             buffer = self._new_feature_error_buffer()
             state.feature_error_buffers[feature_name] = buffer
         return buffer
+
+    def restore_score_buffers_from_threshold_log(self) -> None:
+        if not self.threshold_log_path.exists():
+            return
+
+        restored_scores = 0
+        restored_entities: set[str] = set()
+        try:
+            with self.threshold_log_path.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except Exception:
+                        continue
+                    entity_id = str(payload.get("entity_id", "") or "").strip()
+                    if not entity_id:
+                        continue
+                    score_value = payload.get("score")
+                    if score_value is None:
+                        score_value = payload.get("anomaly_score")
+                    if score_value is None:
+                        continue
+                    state, _, _ = self.get_entity_adaptive_state(entity_id)
+                    state.score_buffer.observe(float(score_value))
+                    state.restored_score_count += 1
+                    restored_scores += 1
+                    restored_entities.add(entity_id)
+        except Exception as exc:
+            print(f"[WARN] Adaptive score history restore failed: {compact_reason(str(exc), limit=160)}")
+            return
+
+        if restored_scores > 0:
+            print(
+                "[STATE] restored adaptive score history | "
+                f"entities={len(restored_entities)} | scores={restored_scores} | "
+                f"source={self.threshold_log_path}"
+            )
+
+    def emit_adaptive_state_debug(
+        self,
+        *,
+        entity_id: str,
+        history_already_existed: bool,
+        history_reinitialized: bool,
+        previous_buffer_length: int,
+        buffer_length_after_append: int,
+        score_appended: bool,
+        window_ready: bool,
+    ) -> None:
+        if not ADAPTIVE_STATE_DEBUG_LOGS:
+            return
+        print(
+            f"[STATE] {entity_id} | "
+            f"history_exists={history_already_existed} | "
+            f"prev_buffer={int(previous_buffer_length)} | "
+            f"after_append={int(buffer_length_after_append)} | "
+            f"appended={bool(score_appended)} | "
+            f"window_ready={bool(window_ready)} | "
+            f"history_reinitialized={bool(history_reinitialized)}"
+        )
+
+    @staticmethod
+    def _matches_any(value: str, patterns: list[str]) -> bool:
+        text = str(value or "")
+        return any(fnmatch.fnmatchcase(text, pattern) for pattern in patterns)
+
+    def alert_filter_reason(self, record: dict[str, Any]) -> str | None:
+        namespace = str(record.get("namespace", "") or record.get("container_app_du", ""))
+        pod = str(record.get("pod", "") or "")
+        container = str(record.get("container_id", "") or record.get("container", ""))
+
+        if self.config.include_namespaces and not self._matches_any(namespace, self.config.include_namespaces):
+            return f"namespace_not_allowlisted:{namespace}"
+        if self.config.include_pods and not self._matches_any(pod, self.config.include_pods):
+            return f"pod_not_allowlisted:{pod}"
+        if self.config.include_containers and not self._matches_any(container, self.config.include_containers):
+            return f"container_not_allowlisted:{container}"
+
+        if self.config.exclude_namespaces and self._matches_any(namespace, self.config.exclude_namespaces):
+            return f"namespace_excluded:{namespace}"
+        if self.config.exclude_pods and self._matches_any(pod, self.config.exclude_pods):
+            return f"pod_excluded:{pod}"
+        if self.config.exclude_containers and self._matches_any(container, self.config.exclude_containers):
+            return f"container_excluded:{container}"
+        return None
+
+    @staticmethod
+    def severity_rank(decision: dict[str, Any]) -> int:
+        severity = str(decision.get("severity", "")).strip().lower()
+        label = str(decision.get("label", "")).strip().lower()
+        severity_map = {
+            "unknown": 0,
+            "low": 1,
+            "medium": 2,
+            "high": 3,
+        }
+        rank = severity_map.get(severity, 0)
+        if label == "critical":
+            rank = max(rank, 4)
+        elif label == "fault_candidate":
+            rank = max(rank, 3)
+        elif label == "warning":
+            rank = max(rank, 2)
+        return rank
+
+    def cooldown_status(
+        self,
+        entity_id: str,
+        time_stamp: int,
+        window_id: int,
+        decision: dict[str, Any],
+    ) -> tuple[bool, str | None]:
+        last_state = self.last_alert_state.get(entity_id)
+        if last_state is None:
+            return False, None
+
+        current_rank = self.severity_rank(decision)
+        last_rank = int(last_state.get("severity_rank", 0))
+        previous_score = to_float(last_state.get("anomaly_score"), 0.0)
+        current_score = to_float(decision.get("anomaly_score"), 0.0)
+        score_ratio = current_score / max(previous_score, 1e-6)
+        is_escalated = current_rank > last_rank or score_ratio >= 1.25
+        if is_escalated:
+            return False, None
+
+        elapsed_seconds = int(time_stamp - int(last_state.get("time_stamp", 0)))
+        elapsed_windows = int(window_id - int(last_state.get("window_id", -1)))
+        seconds_active = elapsed_seconds < int(self.config.cooldown_seconds)
+        windows_active = elapsed_windows < int(self.config.cooldown_windows)
+        if not seconds_active and not windows_active:
+            return False, None
+
+        remaining_seconds = max(0, int(self.config.cooldown_seconds) - max(0, elapsed_seconds))
+        remaining_windows = max(0, int(self.config.cooldown_windows) - max(0, elapsed_windows))
+        return True, f"cooldown:{remaining_seconds}s,{remaining_windows}w"
+
+    def record_alert_state(self, entity_id: str, time_stamp: int, window_id: int, decision: dict[str, Any]) -> None:
+        self.last_alert_state[entity_id] = {
+            "time_stamp": int(time_stamp),
+            "window_id": int(window_id),
+            "severity_rank": self.severity_rank(decision),
+            "anomaly_score": to_float(decision.get("anomaly_score"), 0.0),
+        }
 
     def _build_openai_client(self) -> Any | None:
         api_key = os.getenv("OPENAI_API_KEY")
@@ -471,6 +680,49 @@ class DirectPrometheusAnomalyRunner:
             return None
         from openai import OpenAI
         return OpenAI(api_key=api_key, timeout=self.gpt_config.request_timeout_seconds)
+
+    def send_startup_telegram_test(self) -> None:
+        if not TELEGRAM_STARTUP_TEST_ENABLED:
+            return
+        if not self.telegram_bot_token or not self.telegram_chat_id:
+            print("[WARN] Telegram startup test skipped: missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID.")
+            return
+
+        try:
+            sent, body, error = send_telegram_message(
+                bot_token=str(self.telegram_bot_token),
+                chat_id=str(self.telegram_chat_id),
+                message_text=TELEGRAM_STARTUP_TEST_MESSAGE,
+                timeout_seconds=int(self.config.request_timeout),
+            )
+            append_jsonl(
+                self.telegram_log_path,
+                {
+                    "timestamp": now_iso(),
+                    "startup_test": True,
+                    "telegram_sent": bool(sent),
+                    "error": None if sent else compact_reason(str(error or "telegram_startup_test_failed"), limit=120),
+                    "message_text": TELEGRAM_STARTUP_TEST_MESSAGE,
+                    "message_id": None if body is None else body.get("result", {}).get("message_id"),
+                },
+            )
+            if sent:
+                print("[TELEGRAM] startup test sent")
+            else:
+                print(f"[WARN] Telegram startup test failed: {compact_reason(str(error or 'unknown_error'), limit=160)}")
+        except Exception as exc:
+            error_text = compact_reason(str(exc), limit=160)
+            append_jsonl(
+                self.telegram_log_path,
+                {
+                    "timestamp": now_iso(),
+                    "startup_test": True,
+                    "telegram_sent": False,
+                    "error": error_text,
+                    "message_text": TELEGRAM_STARTUP_TEST_MESSAGE,
+                },
+            )
+            print(f"[WARN] Telegram startup test failed: {error_text}")
 
     def _default_category_metadata(self, context_columns: list[str]) -> dict[str, Any]:
         default_categorical = set(
@@ -772,6 +1024,8 @@ class DirectPrometheusAnomalyRunner:
         pod = str(entity["pod"])
         container = str(entity["container"])
         machine_id = str(entity.get("machine_id", "unknown-machine"))
+        adaptive_state, history_already_existed, history_reinitialized = self.get_entity_adaptive_state(entity_id)
+        existing_score_history_length = adaptive_state.score_buffer.size()
         features = dict(entity.get("features", {}))
 
         context_numeric = {}
@@ -816,17 +1070,23 @@ class DirectPrometheusAnomalyRunner:
         )
 
         window_id = int(self.ready_window_counts.get(entity_id, 0))
-        fixed_threshold = float(self.detector.threshold)
+        fallback_threshold = float(self.detector.threshold)
         response = {
             "entity_id": entity_id,
             "container_id": container,
             "machine_id": machine_id,
             "window_id": window_id,
             "window_ready": bool(result.ready),
-            "threshold": fixed_threshold,
-            "fixed_threshold": fixed_threshold,
+            "threshold": fallback_threshold,
+            "fallback_threshold": fallback_threshold,
+            "static_threshold": fallback_threshold,
+            "fixed_threshold": fallback_threshold,
             "dynamic_threshold": None,
-            "final_threshold": fixed_threshold,
+            "final_threshold": fallback_threshold,
+            "threshold_mode": "warmup",
+            "score_buffer_size": existing_score_history_length,
+            "score_buffer_size_before_decision": existing_score_history_length,
+            "score_buffer_size_after_append": existing_score_history_length,
             "window_size": int(self.detector.window_size),
             "namespace": namespace,
             "pod": pod,
@@ -838,9 +1098,24 @@ class DirectPrometheusAnomalyRunner:
             "start_time": time_stamp,
             "end_time": time_stamp,
             "features": full_features,
+            "z_score": None,
+            "z_score_reason": f"warmup<{ROLLING_SCORE_MIN_BUFFER}",
+            "alert_suppressed_reason": None,
+            "history_already_existed": history_already_existed,
+            "history_reinitialized": history_reinitialized,
+            "history_restored_score_count": int(adaptive_state.restored_score_count),
         }
 
         if not result.ready:
+            self.emit_adaptive_state_debug(
+                entity_id=entity_id,
+                history_already_existed=history_already_existed,
+                history_reinitialized=history_reinitialized,
+                previous_buffer_length=existing_score_history_length,
+                buffer_length_after_append=existing_score_history_length,
+                score_appended=False,
+                window_ready=False,
+            )
             response["status"] = "buffering"
             return response
 
@@ -850,11 +1125,16 @@ class DirectPrometheusAnomalyRunner:
         top_k_feature_errors = [float(value) for value in (result.top_k_feature_errors or [])]
         feature_error_vector = [float(value) for value in (result.feature_error_vector or [])]
 
-        adaptive_state = self.get_entity_adaptive_state(entity_id)
+        history_size = adaptive_state.score_buffer.size()
         score_stats = adaptive_state.score_buffer.summary()
+        adaptive_threshold_ready = bool(history_size >= ROLLING_SCORE_MIN_BUFFER and score_stats is not None)
+        threshold_mode = "dynamic" if adaptive_threshold_ready else "warmup"
         dynamic_threshold = None if score_stats is None else float(score_stats["percentile_threshold"])
-        final_threshold = max(fixed_threshold, dynamic_threshold) if dynamic_threshold is not None else fixed_threshold
-        z_score = adaptive_state.score_buffer.z_score(anomaly_score) if ENABLE_ZSCORE_CANDIDATE else None
+        final_threshold = dynamic_threshold if adaptive_threshold_ready and dynamic_threshold is not None else fallback_threshold
+        if ENABLE_ZSCORE_CANDIDATE:
+            z_score, z_score_reason = adaptive_state.score_buffer.z_score_details(anomaly_score)
+        else:
+            z_score, z_score_reason = None, "zscore_disabled"
         score_threshold_hit = anomaly_score > final_threshold
         z_score_hit = bool(z_score is not None and z_score > ZSCORE_THRESHOLD)
         significant_feature_shift, feature_shift_reason = self.evaluate_feature_shift(
@@ -865,7 +1145,10 @@ class DirectPrometheusAnomalyRunner:
 
         decision_reasons: list[str] = []
         if score_threshold_hit:
-            decision_reasons.append("score_above_threshold")
+            if adaptive_threshold_ready:
+                decision_reasons.append("score_above_dynamic_threshold")
+            else:
+                decision_reasons.append("score_above_fallback_threshold")
         if z_score_hit:
             decision_reasons.append(f"z_score>{ZSCORE_THRESHOLD:.1f}")
         if significant_feature_shift and feature_shift_reason:
@@ -875,6 +1158,16 @@ class DirectPrometheusAnomalyRunner:
         decision_reason = ",".join(decision_reasons) if decision_reasons else "below_all_candidate_rules"
 
         adaptive_state.score_buffer.observe(anomaly_score)
+        score_buffer_size_after_append = adaptive_state.score_buffer.size()
+        self.emit_adaptive_state_debug(
+            entity_id=entity_id,
+            history_already_existed=history_already_existed,
+            history_reinitialized=history_reinitialized,
+            previous_buffer_length=history_size,
+            buffer_length_after_append=score_buffer_size_after_append,
+            score_appended=True,
+            window_ready=True,
+        )
         self.observe_feature_errors(entity_id, feature_error_vector)
         response.update(
             {
@@ -883,20 +1176,31 @@ class DirectPrometheusAnomalyRunner:
                 "anomaly_candidate": bool(anomaly_candidate),
                 "anomaly_score": anomaly_score,
                 "threshold": final_threshold,
-                "fixed_threshold": fixed_threshold,
+                "fallback_threshold": fallback_threshold,
+                "static_threshold": fallback_threshold,
+                "fixed_threshold": fallback_threshold,
                 "dynamic_threshold": dynamic_threshold,
                 "final_threshold": final_threshold,
+                "threshold_mode": threshold_mode,
+                "score_buffer_size": score_buffer_size_after_append,
+                "score_buffer_size_before_decision": history_size,
+                "score_buffer_size_after_append": score_buffer_size_after_append,
                 "score_over_threshold": anomaly_score - final_threshold,
                 "z_score": z_score,
+                "z_score_reason": z_score_reason,
                 "significant_feature_shift": bool(significant_feature_shift),
                 "decision_reason": decision_reason,
                 "top_k_features": top_k_features,
                 "top_k_feature_errors": top_k_feature_errors,
                 "feature_error_vector": feature_error_vector,
+                "adaptive_threshold_ready": adaptive_threshold_ready,
                 "rolling_score_min": None if score_stats is None else float(score_stats["min"]),
                 "rolling_score_max": None if score_stats is None else float(score_stats["max"]),
                 "rolling_score_mean": None if score_stats is None else float(score_stats["mean"]),
-                "rolling_score_percentile_threshold": None if score_stats is None else float(score_stats["percentile_threshold"]),
+                "rolling_score_percentile_threshold": dynamic_threshold,
+                "history_already_existed": history_already_existed,
+                "history_reinitialized": history_reinitialized,
+                "history_restored_score_count": int(adaptive_state.restored_score_count),
                 "metadata": result.metadata or {},
             }
         )
@@ -913,15 +1217,6 @@ class DirectPrometheusAnomalyRunner:
         if call_error:
             return None, f"{call_reason}:{compact_reason(call_error, limit=120)}"
         return None, call_reason
-
-    def in_cooldown(self, entity_id: str, time_stamp: int) -> tuple[bool, int]:
-        last_sent = self.last_notified_at.get(entity_id)
-        if last_sent is None:
-            return False, 0
-        elapsed = int(time_stamp - last_sent)
-        if elapsed >= int(self.config.cooldown_seconds):
-            return False, 0
-        return True, int(self.config.cooldown_seconds - elapsed)
 
     def build_gpt_failure_telegram_payload(
         self,
@@ -945,9 +1240,26 @@ class DirectPrometheusAnomalyRunner:
             ),
         }
 
+    def build_live_result_telegram_payload(
+        self,
+        result: dict[str, Any],
+        *,
+        label: str,
+        severity: str,
+        explanation: str,
+        recommended_action: str,
+    ) -> dict[str, Any]:
+        return {
+            **result,
+            "label": str(label),
+            "severity": str(severity),
+            "explanation": str(explanation),
+            "recommended_action": str(recommended_action),
+        }
+
     def send_telegram_alert(self, decision: dict[str, Any]) -> tuple[bool, str | None]:
         if not self.telegram_enabled:
-            return False, "missing_telegram_credentials"
+            return False, "telegram_disabled"
 
         message_text = format_telegram_alert(decision)
         try:
@@ -983,12 +1295,51 @@ class DirectPrometheusAnomalyRunner:
             )
             return False, error_text
 
+    def deliver_telegram_result(
+        self,
+        decision: dict[str, Any],
+        *,
+        entity_id: str,
+        time_stamp: int,
+        success_message: str,
+    ) -> bool:
+        if not self.telegram_enabled:
+            decision["alert_suppressed_reason"] = "telegram_disabled"
+            if ENABLE_GPT_LOGGING:
+                self.log_gpt_decision(decision, telegram_sent=False)
+            return False
+
+        sent, telegram_error = self.send_telegram_alert(decision)
+        if sent:
+            print(success_message)
+            if ENABLE_GPT_LOGGING:
+                self.log_gpt_decision(decision, telegram_sent=True)
+            return True
+
+        decision["alert_suppressed_reason"] = telegram_error
+        if self.should_print_skip(entity_id, str(telegram_error), time_stamp):
+            print(f"[SKIP] {entity_id} | reason={telegram_error}")
+        if ENABLE_GPT_LOGGING:
+            self.log_gpt_decision(decision, telegram_sent=False)
+        return False
+
     def log_gpt_decision(self, decision: dict[str, Any], telegram_sent: bool) -> None:
         payload = {
             "timestamp": now_iso(),
             "entity_id": decision.get("entity_id"),
             "anomaly_score": decision.get("anomaly_score"),
             "threshold": decision.get("threshold"),
+            "fallback_threshold": decision.get("fallback_threshold"),
+            "static_threshold": decision.get("static_threshold"),
+            "fixed_threshold": decision.get("fixed_threshold"),
+            "dynamic_threshold": decision.get("dynamic_threshold"),
+            "final_threshold": decision.get("final_threshold"),
+            "threshold_mode": decision.get("threshold_mode"),
+            "score_buffer_size": decision.get("score_buffer_size"),
+            "z_score": decision.get("z_score"),
+            "z_score_reason": decision.get("z_score_reason"),
+            "decision_reason": decision.get("decision_reason"),
+            "alert_suppressed_reason": decision.get("alert_suppressed_reason"),
             "top_features": decision.get("top_k_features", []),
             "gpt_label": decision.get("label"),
             "gpt_severity": decision.get("severity"),
@@ -1006,6 +1357,17 @@ class DirectPrometheusAnomalyRunner:
             "machine_id": decision.get("machine_id"),
             "anomaly_score": decision.get("anomaly_score"),
             "threshold": decision.get("threshold"),
+            "fallback_threshold": decision.get("fallback_threshold"),
+            "static_threshold": decision.get("static_threshold"),
+            "fixed_threshold": decision.get("fixed_threshold"),
+            "dynamic_threshold": decision.get("dynamic_threshold"),
+            "final_threshold": decision.get("final_threshold"),
+            "threshold_mode": decision.get("threshold_mode"),
+            "score_buffer_size": decision.get("score_buffer_size"),
+            "z_score": decision.get("z_score"),
+            "z_score_reason": decision.get("z_score_reason"),
+            "decision_reason": decision.get("decision_reason"),
+            "alert_suppressed_reason": decision.get("alert_suppressed_reason"),
             "status": status,
             "response_id": decision.get("response_id"),
             "gpt_model": decision.get("gpt_model"),
@@ -1036,6 +1398,17 @@ class DirectPrometheusAnomalyRunner:
             "machine_id": decision.get("machine_id"),
             "anomaly_score": decision.get("anomaly_score"),
             "threshold": decision.get("threshold"),
+            "fallback_threshold": decision.get("fallback_threshold"),
+            "static_threshold": decision.get("static_threshold"),
+            "fixed_threshold": decision.get("fixed_threshold"),
+            "dynamic_threshold": decision.get("dynamic_threshold"),
+            "final_threshold": decision.get("final_threshold"),
+            "threshold_mode": decision.get("threshold_mode"),
+            "score_buffer_size": decision.get("score_buffer_size"),
+            "z_score": decision.get("z_score"),
+            "z_score_reason": decision.get("z_score_reason"),
+            "decision_reason": decision.get("decision_reason"),
+            "alert_suppressed_reason": decision.get("alert_suppressed_reason"),
             "label": decision.get("label"),
             "severity": decision.get("severity"),
             "recommended_action": decision.get("recommended_action"),
@@ -1050,17 +1423,29 @@ class DirectPrometheusAnomalyRunner:
             "timestamp": now_iso(),
             "entity_id": window_result.get("entity_id"),
             "score": window_result.get("anomaly_score"),
+            "fallback_threshold": window_result.get("fallback_threshold"),
+            "static_threshold": window_result.get("static_threshold"),
             "fixed_threshold": window_result.get("fixed_threshold"),
             "dynamic_threshold": window_result.get("dynamic_threshold"),
             "final_threshold": window_result.get("final_threshold"),
+            "threshold_mode": window_result.get("threshold_mode"),
+            "score_buffer_size": window_result.get("score_buffer_size"),
+            "score_buffer_size_before_decision": window_result.get("score_buffer_size_before_decision"),
+            "score_buffer_size_after_append": window_result.get("score_buffer_size_after_append"),
+            "adaptive_threshold_ready": window_result.get("adaptive_threshold_ready"),
             "z_score": window_result.get("z_score"),
+            "z_score_reason": window_result.get("z_score_reason"),
             "top_k_features": window_result.get("top_k_features", []),
             "top_k_feature_errors": window_result.get("top_k_feature_errors", []),
             "rolling_score_min": window_result.get("rolling_score_min"),
             "rolling_score_max": window_result.get("rolling_score_max"),
             "rolling_score_mean": window_result.get("rolling_score_mean"),
             "rolling_score_percentile_threshold": window_result.get("rolling_score_percentile_threshold"),
+            "history_already_existed": window_result.get("history_already_existed"),
+            "history_reinitialized": window_result.get("history_reinitialized"),
+            "history_restored_score_count": window_result.get("history_restored_score_count"),
             "decision_reason": window_result.get("decision_reason"),
+            "alert_suppressed_reason": window_result.get("alert_suppressed_reason"),
             "decision": window_result.get("status"),
         }
         append_jsonl(self.threshold_log_path, payload)
@@ -1083,55 +1468,69 @@ class DirectPrometheusAnomalyRunner:
             return False, "gpt_label_normal"
         return True, None
 
+    def emit_result_line(self, prefix: str, result: dict[str, Any]) -> None:
+        z_display = format_metric_value(result.get("z_score"), precision=3)
+        z_reason = str(result.get("z_score_reason", "") or "").strip()
+        z_fragment = f"z={z_display}" if result.get("z_score") is not None else f"z={z_display}:{z_reason}"
+        print(
+            f"[{prefix}] {result.get('entity_id', 'unknown')} | "
+            f"score={format_metric_value(result.get('anomaly_score'))} | "
+            f"static={format_metric_value(result.get('static_threshold', result.get('fallback_threshold')))} | "
+            f"dynamic={format_metric_value(result.get('dynamic_threshold'))} | "
+            f"final={format_metric_value(result.get('final_threshold'))} | "
+            f"{z_fragment} | "
+            f"buffer={int(result.get('score_buffer_size', 0))} | "
+            f"mode={result.get('threshold_mode', 'unknown')} | "
+            f"reason={result.get('decision_reason', 'unknown')}"
+        )
+
     def handle_ready_result(self, result: dict[str, Any], time_stamp: int) -> None:
         entity_id = str(result["entity_id"])
 
         if int(result.get("predicted_label", 0)) != 1:
-            print(
-                f"[NORMAL] {entity_id} | "
-                f"score={float(result.get('anomaly_score', 0.0)):.6f} | "
-                f"final_threshold={float(result.get('final_threshold', 0.0)):.6f}"
+            self.emit_result_line("NORMAL", result)
+            return
+
+        filter_reason = self.alert_filter_reason(result)
+        if filter_reason:
+            result["alert_suppressed_reason"] = filter_reason
+            self.emit_result_line("FILTERED", result)
+            print(f"[SUPPRESS] {entity_id} | reason={filter_reason}")
+            filtered_decision = self.build_live_result_telegram_payload(
+                result,
+                label="warning",
+                severity="low",
+                explanation=f"Matched configured filter: {filter_reason}. Forwarded to Telegram because all results are enabled.",
+                recommended_action="monitor",
+            )
+            self.deliver_telegram_result(
+                filtered_decision,
+                entity_id=entity_id,
+                time_stamp=time_stamp,
+                success_message=f"[TELEGRAM] {entity_id} | sent | filtered",
             )
             return
 
-        dynamic_display = result.get("dynamic_threshold")
-        if dynamic_display is None:
-            dynamic_display = result.get("fixed_threshold", 0.0)
-        print(
-            f"[CANDIDATE] {entity_id} | "
-            f"score={float(result.get('anomaly_score', 0.0)):.6f} | "
-            f"static={float(result.get('fixed_threshold', 0.0)):.6f} | "
-            f"dynamic={float(dynamic_display or 0.0):.6f} | "
-            f"z={float(result.get('z_score', 0.0) or 0.0):.3f} | "
-            f"reason={result.get('decision_reason', 'unknown')}"
-        )
+        self.emit_result_line("CANDIDATE", result)
 
         decision, gpt_error = self.adjudicate_with_gpt(result)
         if decision is None:
             fallback_decision = self.build_gpt_failure_telegram_payload(result, str(gpt_error))
             self.log_gpt_response(fallback_decision, status="gpt_failed_fallback")
-
-            cooldown_active, remaining = self.in_cooldown(entity_id, time_stamp)
+            window_id = int(result.get("window_id", -1))
+            cooldown_active, cooldown_reason = self.cooldown_status(entity_id, time_stamp, window_id, fallback_decision)
             if cooldown_active:
-                reason = f"cooldown_active:{remaining}s_remaining"
-                if self.should_print_skip(entity_id, reason, time_stamp):
-                    print(f"[SKIP] {entity_id} | reason={reason}")
-                if ENABLE_GPT_LOGGING:
-                    self.log_gpt_decision(fallback_decision, telegram_sent=False)
-                return
-
-            sent, telegram_error = self.send_telegram_alert(fallback_decision)
-            if sent:
-                self.last_notified_at[entity_id] = int(time_stamp)
-                print(f"[TELEGRAM] {entity_id} | sent | gpt_failed={gpt_error}")
-                if ENABLE_GPT_LOGGING:
-                    self.log_gpt_decision(fallback_decision, telegram_sent=True)
-                return
-
-            if self.should_print_skip(entity_id, str(telegram_error), time_stamp):
-                print(f"[SKIP] {entity_id} | reason={telegram_error}")
-            if ENABLE_GPT_LOGGING:
-                self.log_gpt_decision(fallback_decision, telegram_sent=False)
+                fallback_decision["alert_suppressed_reason"] = cooldown_reason
+                if self.should_print_skip(entity_id, str(cooldown_reason), time_stamp):
+                    print(f"[SUPPRESS] {entity_id} | reason={cooldown_reason}")
+            else:
+                self.record_alert_state(entity_id, time_stamp, window_id, fallback_decision)
+            self.deliver_telegram_result(
+                fallback_decision,
+                entity_id=entity_id,
+                time_stamp=time_stamp,
+                success_message=f"[TELEGRAM] {entity_id} | sent | gpt_failed={gpt_error}",
+            )
             return
 
         if str(decision["label"]).strip().lower() == "normal":
@@ -1149,33 +1548,27 @@ class DirectPrometheusAnomalyRunner:
 
         should_send, skip_reason = self.should_send_telegram_result(decision)
         if not should_send:
+            decision["alert_suppressed_reason"] = skip_reason
             if self.should_print_skip(entity_id, str(skip_reason), time_stamp):
                 print(f"[SKIP] {entity_id} | reason={skip_reason}")
             if ENABLE_GPT_LOGGING:
                 self.log_gpt_decision(decision, telegram_sent=False)
             return
 
-        cooldown_active, remaining = self.in_cooldown(entity_id, time_stamp)
+        window_id = int(result.get("window_id", -1))
+        cooldown_active, cooldown_reason = self.cooldown_status(entity_id, time_stamp, window_id, decision)
         if cooldown_active:
-            reason = f"cooldown_active:{remaining}s_remaining"
-            if self.should_print_skip(entity_id, reason, time_stamp):
-                print(f"[SKIP] {entity_id} | reason={reason}")
-            if ENABLE_GPT_LOGGING:
-                self.log_gpt_decision(decision, telegram_sent=False)
-            return
-
-        sent, telegram_error = self.send_telegram_alert(decision)
-        if sent:
-            self.last_notified_at[entity_id] = int(time_stamp)
-            print(f"[TELEGRAM] {entity_id} | sent")
-            if ENABLE_GPT_LOGGING:
-                self.log_gpt_decision(decision, telegram_sent=True)
-            return
-
-        if self.should_print_skip(entity_id, str(telegram_error), time_stamp):
-            print(f"[SKIP] {entity_id} | reason={telegram_error}")
-        if ENABLE_GPT_LOGGING:
-            self.log_gpt_decision(decision, telegram_sent=False)
+            decision["alert_suppressed_reason"] = cooldown_reason
+            if self.should_print_skip(entity_id, str(cooldown_reason), time_stamp):
+                print(f"[SUPPRESS] {entity_id} | reason={cooldown_reason}")
+        else:
+            self.record_alert_state(entity_id, time_stamp, window_id, decision)
+        self.deliver_telegram_result(
+            decision,
+            entity_id=entity_id,
+            time_stamp=time_stamp,
+            success_message=f"[TELEGRAM] {entity_id} | sent",
+        )
 
     def run_once(self) -> None:
         snapshot = self.collect_snapshot()
@@ -1200,11 +1593,20 @@ class DirectPrometheusAnomalyRunner:
         print(f"Prometheus: {self.config.prom_url}")
         print(f"Model dir : {self.config.model_dir}")
         print(f"Device    : requested={self.config.device} resolved={self.resolved_device}")
-        print(f"Cooldown  : {self.config.cooldown_seconds}s")
+        print(f"Cooldown  : {self.config.cooldown_seconds}s / {self.config.cooldown_windows} windows")
         print(f"Log file  : {self.decision_log_path}")
         print(f"GPT log   : {self.gpt_response_log_path}")
         print(f"Telegram log: {self.telegram_log_path}")
         print(f"Threshold log: {self.threshold_log_path}")
+        print(
+            "Alert filters: "
+            f"include_ns={self.config.include_namespaces or ['*']} | "
+            f"exclude_ns={self.config.exclude_namespaces or []} | "
+            f"include_pods={self.config.include_pods or ['*']} | "
+            f"exclude_pods={self.config.exclude_pods or []} | "
+            f"include_containers={self.config.include_containers or ['*']} | "
+            f"exclude_containers={self.config.exclude_containers or []}"
+        )
         print(
             "Adaptive threshold: "
             f"buffer={ROLLING_SCORE_BUFFER_SIZE}, "
@@ -1237,6 +1639,7 @@ def parse_args() -> RuntimeConfig:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--top-k-features", type=int, default=5)
     parser.add_argument("--cooldown-seconds", type=int, default=300)
+    parser.add_argument("--cooldown-windows", type=int, default=env_int("LIVE_ALERT_COOLDOWN_WINDOWS", 3))
     parser.add_argument("--skip-log-cooldown-seconds", type=int, default=300)
     parser.add_argument(
         "--results-dir",
@@ -1255,6 +1658,7 @@ def parse_args() -> RuntimeConfig:
         device=args.device,
         top_k_features=args.top_k_features,
         cooldown_seconds=max(0, int(args.cooldown_seconds)),
+        cooldown_windows=max(0, int(args.cooldown_windows)),
         skip_log_cooldown_seconds=max(0, int(args.skip_log_cooldown_seconds)),
         results_dir=Path(args.results_dir).expanduser().resolve(),
     )
