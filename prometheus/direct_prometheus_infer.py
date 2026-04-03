@@ -1257,6 +1257,15 @@ class DirectPrometheusAnomalyRunner:
             "recommended_action": str(recommended_action),
         }
 
+    def build_model_candidate_decision(self, result: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **result,
+            "label": "model_candidate",
+            "severity": "unknown",
+            "explanation": "",
+            "recommended_action": "monitor",
+        }
+
     def send_telegram_alert(self, decision: dict[str, Any]) -> tuple[bool, str | None]:
         if not self.telegram_enabled:
             return False, "telegram_disabled"
@@ -1513,11 +1522,22 @@ class DirectPrometheusAnomalyRunner:
 
         self.emit_result_line("CANDIDATE", result)
 
+        window_id = int(result.get("window_id", -1))
+        pre_gpt_decision = self.build_model_candidate_decision(result)
+        cooldown_active, cooldown_reason = self.cooldown_status(entity_id, time_stamp, window_id, pre_gpt_decision)
+        if cooldown_active:
+            result["alert_suppressed_reason"] = cooldown_reason
+            if self.should_print_skip(entity_id, str(cooldown_reason), time_stamp):
+                print(f"[SUPPRESS] {entity_id} | reason={cooldown_reason} | gpt_skipped")
+            self.log_gpt_response(pre_gpt_decision, status="cooldown_skipped_before_gpt")
+            if ENABLE_GPT_LOGGING:
+                self.log_gpt_decision(pre_gpt_decision, telegram_sent=False)
+            return
+
         decision, gpt_error = self.adjudicate_with_gpt(result)
         if decision is None:
             fallback_decision = self.build_gpt_failure_telegram_payload(result, str(gpt_error))
             self.log_gpt_response(fallback_decision, status="gpt_failed_fallback")
-            window_id = int(result.get("window_id", -1))
             cooldown_active, cooldown_reason = self.cooldown_status(entity_id, time_stamp, window_id, fallback_decision)
             if cooldown_active:
                 fallback_decision["alert_suppressed_reason"] = cooldown_reason
@@ -1555,7 +1575,6 @@ class DirectPrometheusAnomalyRunner:
                 self.log_gpt_decision(decision, telegram_sent=False)
             return
 
-        window_id = int(result.get("window_id", -1))
         cooldown_active, cooldown_reason = self.cooldown_status(entity_id, time_stamp, window_id, decision)
         if cooldown_active:
             decision["alert_suppressed_reason"] = cooldown_reason
