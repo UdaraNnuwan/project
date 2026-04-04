@@ -4,7 +4,7 @@
   "loss_curve_path": "C:\\Users\\kaspe\\Desktop\\Project\\project\\results\\loss_curve.png",
   "model_path": "C:\\Users\\kaspe\\Desktop\\Project\\project\\models\\research_smoke_auto\\film_ae.pt",
   "detector_meta": {
-    "threshold": 4.342864990234375,
+    "threshold": 4.6121673583984375,
     "threshold_quantile": 0.995,
     "window_size": 30,
     "n_features": 8,
@@ -13,9 +13,9 @@
     "num_train_windows": 139011,
     "num_val_windows": 15446,
     "num_test_windows": 39160,
-    "best_val_loss": 0.5564422328172224,
-    "val_score_mean": 0.5564422011375427,
-    "val_score_std": 0.727505087852478,
+    "best_val_loss": 0.5636702044345424,
+    "val_score_mean": 0.5636701583862305,
+    "val_score_std": 0.7434863448143005,
     "test_split_rows": 39160
   },
   "train_config": {
