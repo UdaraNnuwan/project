@@ -111,6 +111,16 @@ def env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
 def format_metric_value(value: Any, precision: int = 6, default: str = "n/a") -> str:
     if value is None:
         return default
@@ -118,6 +128,69 @@ def format_metric_value(value: Any, precision: int = 6, default: str = "n/a") ->
         return f"{float(value):.{precision}f}"
     except Exception:
         return default
+
+
+VOLATILITY_LOOKBACK = max(5, env_int("LIVE_VOLATILITY_LOOKBACK", 30))
+VOLATILITY_MIN_BUFFER = max(5, env_int("LIVE_VOLATILITY_MIN_BUFFER", 15))
+VOLATILITY_LOW_MAX = env_float("LIVE_VOLATILITY_LOW_MAX", 0.15)
+VOLATILITY_HIGH_MIN = env_float("LIVE_VOLATILITY_HIGH_MIN", 0.35)
+
+
+@dataclass(frozen=True)
+class AdaptiveDecisionProfile:
+    band: str
+    threshold_percentile: float
+    consecutive_windows: int
+    smoothing_window: int
+    cooldown_windows: int
+
+
+LOW_VOLATILITY_PROFILE = AdaptiveDecisionProfile(
+    band="low",
+    threshold_percentile=env_float("LIVE_LOW_VOLATILITY_PERCENTILE", 99.0),
+    consecutive_windows=max(1, env_int("LIVE_LOW_VOLATILITY_CONSECUTIVE_WINDOWS", 2)),
+    smoothing_window=max(1, env_int("LIVE_LOW_VOLATILITY_SMOOTHING_WINDOW", 3)),
+    cooldown_windows=max(0, env_int("LIVE_LOW_VOLATILITY_COOLDOWN_WINDOWS", 2)),
+)
+MEDIUM_VOLATILITY_PROFILE = AdaptiveDecisionProfile(
+    band="medium",
+    threshold_percentile=env_float("LIVE_MEDIUM_VOLATILITY_PERCENTILE", 99.3),
+    consecutive_windows=max(1, env_int("LIVE_MEDIUM_VOLATILITY_CONSECUTIVE_WINDOWS", 3)),
+    smoothing_window=max(1, env_int("LIVE_MEDIUM_VOLATILITY_SMOOTHING_WINDOW", 5)),
+    cooldown_windows=max(0, env_int("LIVE_MEDIUM_VOLATILITY_COOLDOWN_WINDOWS", 3)),
+)
+HIGH_VOLATILITY_PROFILE = AdaptiveDecisionProfile(
+    band="high",
+    threshold_percentile=env_float("LIVE_HIGH_VOLATILITY_PERCENTILE", 99.7),
+    consecutive_windows=max(1, env_int("LIVE_HIGH_VOLATILITY_CONSECUTIVE_WINDOWS", 5)),
+    smoothing_window=max(1, env_int("LIVE_HIGH_VOLATILITY_SMOOTHING_WINDOW", 7)),
+    cooldown_windows=max(0, env_int("LIVE_HIGH_VOLATILITY_COOLDOWN_WINDOWS", 5)),
+)
+DEFAULT_VOLATILITY_PROFILE = MEDIUM_VOLATILITY_PROFILE
+
+
+def trailing_moving_average(values: np.ndarray, window: int) -> np.ndarray:
+    series = np.asarray(values, dtype=np.float32)
+    if series.size == 0:
+        return series
+    width = max(1, int(window))
+    if width == 1:
+        return series.astype(np.float32, copy=True)
+
+    cumulative = np.cumsum(series, dtype=np.float64)
+    smoothed = np.empty(series.size, dtype=np.float64)
+    for index in range(series.size):
+        start = max(0, index - width + 1)
+        total = cumulative[index] - (cumulative[start - 1] if start > 0 else 0.0)
+        smoothed[index] = total / float(index - start + 1)
+    return smoothed.astype(np.float32)
+
+
+def compute_percentile_threshold(values: np.ndarray, percentile: float) -> float | None:
+    series = np.asarray(values, dtype=np.float32)
+    if series.size == 0:
+        return None
+    return float(np.percentile(series, float(percentile)))
 
 
 class CategoryEncoder:
@@ -189,10 +262,15 @@ class RollingStatsBuffer:
         self.percentile = float(percentile)
         self.min_buffer = max(1, int(min_buffer))
 
+    def values(self) -> np.ndarray:
+        if not self.buffer:
+            return np.asarray([], dtype=np.float32)
+        return np.asarray(self.buffer, dtype=np.float32)
+
     def summary(self) -> dict[str, float] | None:
         if len(self.buffer) < self.min_buffer:
             return None
-        scores = np.asarray(self.buffer, dtype=np.float32)
+        scores = self.values()
         return {
             "min": float(np.min(scores)),
             "max": float(np.max(scores)),
@@ -228,6 +306,11 @@ class EntityAdaptiveState:
     score_buffer: RollingStatsBuffer
     feature_error_buffers: dict[str, RollingStatsBuffer]
     restored_score_count: int = 0
+    consecutive_breach_count: int = 0
+    last_confirmed_time_stamp: int | None = None
+    last_confirmed_window_id: int | None = None
+    last_confirmed_cooldown_seconds: int = 0
+    last_confirmed_cooldown_windows: int = 0
 
 
 @dataclass
@@ -449,7 +532,6 @@ class DirectPrometheusAnomalyRunner:
         )
         self.entity_adaptive_state: dict[str, EntityAdaptiveState] = {}
         self.entity_state_creation_counts: dict[str, int] = {}
-        self.last_alert_state: dict[str, dict[str, Any]] = {}
         self.last_skip_logged_at: dict[tuple[str, str], int] = {}
         self.ready_window_counts: dict[str, int] = {}
 
@@ -614,63 +696,89 @@ class DirectPrometheusAnomalyRunner:
             return f"container_excluded:{container}"
         return None
 
-    @staticmethod
-    def severity_rank(decision: dict[str, Any]) -> int:
-        severity = str(decision.get("severity", "")).strip().lower()
-        label = str(decision.get("label", "")).strip().lower()
-        severity_map = {
-            "unknown": 0,
-            "low": 1,
-            "medium": 2,
-            "high": 3,
-        }
-        rank = severity_map.get(severity, 0)
-        if label == "critical":
-            rank = max(rank, 4)
-        elif label == "fault_candidate":
-            rank = max(rank, 3)
-        elif label == "warning":
-            rank = max(rank, 2)
-        return rank
+    def recent_volatility(
+        self,
+        score_buffer: RollingStatsBuffer,
+    ) -> tuple[float | None, float | None, float | None, int]:
+        recent_scores = score_buffer.values()
+        if recent_scores.size == 0:
+            return None, None, None, 0
+
+        if recent_scores.size > VOLATILITY_LOOKBACK:
+            recent_scores = recent_scores[-VOLATILITY_LOOKBACK:]
+
+        sample_size = int(recent_scores.size)
+        mean_value = float(np.mean(recent_scores))
+        std_value = float(np.std(recent_scores))
+        if sample_size < VOLATILITY_MIN_BUFFER:
+            return None, mean_value, std_value, sample_size
+
+        denominator = max(abs(mean_value), STATS_STD_EPS)
+        volatility = float(std_value / denominator)
+        return volatility, mean_value, std_value, sample_size
+
+    def adaptive_decision_profile(
+        self,
+        score_buffer: RollingStatsBuffer,
+    ) -> tuple[AdaptiveDecisionProfile, float | None, float | None, float | None, int]:
+        volatility, mean_value, std_value, sample_size = self.recent_volatility(score_buffer)
+        if volatility is None:
+            return DEFAULT_VOLATILITY_PROFILE, volatility, mean_value, std_value, sample_size
+        if volatility < VOLATILITY_LOW_MAX:
+            return LOW_VOLATILITY_PROFILE, volatility, mean_value, std_value, sample_size
+        if volatility >= VOLATILITY_HIGH_MIN:
+            return HIGH_VOLATILITY_PROFILE, volatility, mean_value, std_value, sample_size
+        return MEDIUM_VOLATILITY_PROFILE, volatility, mean_value, std_value, sample_size
+
+    def adaptive_cooldown_seconds(self, cooldown_windows: int) -> int:
+        configured_windows = max(1, int(self.config.cooldown_windows))
+        configured_seconds = max(0, int(self.config.cooldown_seconds))
+        scaled_seconds = int(round(configured_seconds * (float(cooldown_windows) / float(configured_windows))))
+        window_seconds = max(0, int(self.config.poll_interval)) * max(0, int(cooldown_windows))
+        return max(scaled_seconds, window_seconds)
 
     def cooldown_status(
         self,
-        entity_id: str,
+        adaptive_state: EntityAdaptiveState,
         time_stamp: int,
         window_id: int,
-        decision: dict[str, Any],
+        cooldown_seconds: int,
+        cooldown_windows: int,
     ) -> tuple[bool, str | None]:
-        last_state = self.last_alert_state.get(entity_id)
-        if last_state is None:
+        if adaptive_state.last_confirmed_time_stamp is None or adaptive_state.last_confirmed_window_id is None:
             return False, None
 
-        current_rank = self.severity_rank(decision)
-        last_rank = int(last_state.get("severity_rank", 0))
-        previous_score = to_float(last_state.get("anomaly_score"), 0.0)
-        current_score = to_float(decision.get("anomaly_score"), 0.0)
-        score_ratio = current_score / max(previous_score, 1e-6)
-        is_escalated = current_rank > last_rank or score_ratio >= 1.25
-        if is_escalated:
-            return False, None
-
-        elapsed_seconds = int(time_stamp - int(last_state.get("time_stamp", 0)))
-        elapsed_windows = int(window_id - int(last_state.get("window_id", -1)))
-        seconds_active = elapsed_seconds < int(self.config.cooldown_seconds)
-        windows_active = elapsed_windows < int(self.config.cooldown_windows)
+        effective_cooldown_seconds = max(
+            0,
+            int(adaptive_state.last_confirmed_cooldown_seconds or cooldown_seconds),
+        )
+        effective_cooldown_windows = max(
+            0,
+            int(adaptive_state.last_confirmed_cooldown_windows or cooldown_windows),
+        )
+        elapsed_seconds = int(time_stamp - int(adaptive_state.last_confirmed_time_stamp))
+        elapsed_windows = int(window_id - int(adaptive_state.last_confirmed_window_id))
+        seconds_active = elapsed_seconds < effective_cooldown_seconds
+        windows_active = elapsed_windows < effective_cooldown_windows
         if not seconds_active and not windows_active:
             return False, None
 
-        remaining_seconds = max(0, int(self.config.cooldown_seconds) - max(0, elapsed_seconds))
-        remaining_windows = max(0, int(self.config.cooldown_windows) - max(0, elapsed_windows))
+        remaining_seconds = max(0, effective_cooldown_seconds - max(0, elapsed_seconds))
+        remaining_windows = max(0, effective_cooldown_windows - max(0, elapsed_windows))
         return True, f"cooldown:{remaining_seconds}s,{remaining_windows}w"
 
-    def record_alert_state(self, entity_id: str, time_stamp: int, window_id: int, decision: dict[str, Any]) -> None:
-        self.last_alert_state[entity_id] = {
-            "time_stamp": int(time_stamp),
-            "window_id": int(window_id),
-            "severity_rank": self.severity_rank(decision),
-            "anomaly_score": to_float(decision.get("anomaly_score"), 0.0),
-        }
+    def record_alert_state(
+        self,
+        adaptive_state: EntityAdaptiveState,
+        time_stamp: int,
+        window_id: int,
+        cooldown_seconds: int,
+        cooldown_windows: int,
+    ) -> None:
+        adaptive_state.last_confirmed_time_stamp = int(time_stamp)
+        adaptive_state.last_confirmed_window_id = int(window_id)
+        adaptive_state.last_confirmed_cooldown_seconds = max(0, int(cooldown_seconds))
+        adaptive_state.last_confirmed_cooldown_windows = max(0, int(cooldown_windows))
 
     def _build_openai_client(self) -> Any | None:
         api_key = os.getenv("OPENAI_API_KEY")
@@ -1084,6 +1192,7 @@ class DirectPrometheusAnomalyRunner:
             "dynamic_threshold": None,
             "final_threshold": fallback_threshold,
             "threshold_mode": "warmup",
+            "smoothed_score": None,
             "score_buffer_size": existing_score_history_length,
             "score_buffer_size_before_decision": existing_score_history_length,
             "score_buffer_size_after_append": existing_score_history_length,
@@ -1100,6 +1209,20 @@ class DirectPrometheusAnomalyRunner:
             "features": full_features,
             "z_score": None,
             "z_score_reason": f"warmup<{ROLLING_SCORE_MIN_BUFFER}",
+            "recent_volatility": None,
+            "recent_volatility_mean": None,
+            "recent_volatility_std": None,
+            "recent_volatility_sample_size": 0,
+            "volatility_band": DEFAULT_VOLATILITY_PROFILE.band,
+            "adaptive_threshold_percentile": float(DEFAULT_VOLATILITY_PROFILE.threshold_percentile),
+            "adaptive_consecutive_windows": int(DEFAULT_VOLATILITY_PROFILE.consecutive_windows),
+            "adaptive_smoothing_window": int(DEFAULT_VOLATILITY_PROFILE.smoothing_window),
+            "adaptive_cooldown_windows": int(DEFAULT_VOLATILITY_PROFILE.cooldown_windows),
+            "adaptive_cooldown_seconds": int(self.adaptive_cooldown_seconds(DEFAULT_VOLATILITY_PROFILE.cooldown_windows)),
+            "current_consecutive_breach_count": int(adaptive_state.consecutive_breach_count),
+            "confirmed_anomaly": False,
+            "significant_feature_shift": False,
+            "decision_reason": "buffering",
             "alert_suppressed_reason": None,
             "history_already_existed": history_already_existed,
             "history_reinitialized": history_reinitialized,
@@ -1126,35 +1249,87 @@ class DirectPrometheusAnomalyRunner:
         feature_error_vector = [float(value) for value in (result.feature_error_vector or [])]
 
         history_size = adaptive_state.score_buffer.size()
+        score_history = adaptive_state.score_buffer.values()
         score_stats = adaptive_state.score_buffer.summary()
-        adaptive_threshold_ready = bool(history_size >= ROLLING_SCORE_MIN_BUFFER and score_stats is not None)
+        adaptive_profile, recent_volatility, volatility_mean, volatility_std, volatility_sample_size = self.adaptive_decision_profile(
+            adaptive_state.score_buffer
+        )
+        smoothed_history = trailing_moving_average(score_history, adaptive_profile.smoothing_window)
+        smoothed_score = float(
+            trailing_moving_average(
+                np.append(score_history, np.asarray([anomaly_score], dtype=np.float32)),
+                adaptive_profile.smoothing_window,
+            )[-1]
+        )
+        dynamic_threshold = compute_percentile_threshold(smoothed_history, adaptive_profile.threshold_percentile)
+        adaptive_threshold_ready = bool(history_size >= ROLLING_SCORE_MIN_BUFFER and dynamic_threshold is not None)
         threshold_mode = "dynamic" if adaptive_threshold_ready else "warmup"
-        dynamic_threshold = None if score_stats is None else float(score_stats["percentile_threshold"])
         final_threshold = dynamic_threshold if adaptive_threshold_ready and dynamic_threshold is not None else fallback_threshold
         if ENABLE_ZSCORE_CANDIDATE:
             z_score, z_score_reason = adaptive_state.score_buffer.z_score_details(anomaly_score)
         else:
             z_score, z_score_reason = None, "zscore_disabled"
-        score_threshold_hit = anomaly_score > final_threshold
+        score_threshold_hit = smoothed_score > final_threshold
         z_score_hit = bool(z_score is not None and z_score > ZSCORE_THRESHOLD)
         significant_feature_shift, feature_shift_reason = self.evaluate_feature_shift(
             entity_id=entity_id,
             top_k_features=top_k_features,
             top_k_feature_errors=top_k_feature_errors,
         )
+        adaptive_cooldown_seconds = self.adaptive_cooldown_seconds(adaptive_profile.cooldown_windows)
+        if score_threshold_hit:
+            adaptive_state.consecutive_breach_count += 1
+        else:
+            adaptive_state.consecutive_breach_count = 0
+        consecutive_breach_count = int(adaptive_state.consecutive_breach_count)
+        candidate_signal = bool(score_threshold_hit or z_score_hit or significant_feature_shift)
+        cooldown_active, cooldown_reason = self.cooldown_status(
+            adaptive_state=adaptive_state,
+            time_stamp=time_stamp,
+            window_id=window_id,
+            cooldown_seconds=adaptive_cooldown_seconds,
+            cooldown_windows=adaptive_profile.cooldown_windows,
+        )
 
         decision_reasons: list[str] = []
         if score_threshold_hit:
             if adaptive_threshold_ready:
-                decision_reasons.append("score_above_dynamic_threshold")
+                decision_reasons.append("smoothed_score_above_dynamic_threshold")
             else:
-                decision_reasons.append("score_above_fallback_threshold")
+                decision_reasons.append("smoothed_score_above_fallback_threshold")
         if z_score_hit:
             decision_reasons.append(f"z_score>{ZSCORE_THRESHOLD:.1f}")
         if significant_feature_shift and feature_shift_reason:
             decision_reasons.append(feature_shift_reason)
+        if score_threshold_hit:
+            decision_reasons.append(
+                f"consecutive_breach={consecutive_breach_count}/{adaptive_profile.consecutive_windows}"
+            )
 
-        anomaly_candidate = bool(score_threshold_hit or z_score_hit or significant_feature_shift)
+        confirmed_anomaly = False
+        if candidate_signal and cooldown_active:
+            status = "suppressed"
+            adaptive_state.consecutive_breach_count = 0
+            if cooldown_reason:
+                decision_reasons.append(cooldown_reason)
+        elif score_threshold_hit and consecutive_breach_count >= adaptive_profile.consecutive_windows:
+            status = "confirmed_anomaly"
+            confirmed_anomaly = True
+            self.record_alert_state(
+                adaptive_state=adaptive_state,
+                time_stamp=time_stamp,
+                window_id=window_id,
+                cooldown_seconds=adaptive_cooldown_seconds,
+                cooldown_windows=adaptive_profile.cooldown_windows,
+            )
+            adaptive_state.consecutive_breach_count = 0
+            decision_reasons.append("confirmed_after_consecutive_breaches")
+        elif candidate_signal:
+            status = "candidate"
+        else:
+            status = "normal"
+
+        anomaly_candidate = bool(candidate_signal)
         decision_reason = ",".join(decision_reasons) if decision_reasons else "below_all_candidate_rules"
 
         adaptive_state.score_buffer.observe(anomaly_score)
@@ -1171,10 +1346,12 @@ class DirectPrometheusAnomalyRunner:
         self.observe_feature_errors(entity_id, feature_error_vector)
         response.update(
             {
-                "status": "candidate" if anomaly_candidate else "normal",
-                "predicted_label": int(anomaly_candidate),
+                "status": status,
+                "predicted_label": int(confirmed_anomaly),
                 "anomaly_candidate": bool(anomaly_candidate),
+                "confirmed_anomaly": bool(confirmed_anomaly),
                 "anomaly_score": anomaly_score,
+                "smoothed_score": smoothed_score,
                 "threshold": final_threshold,
                 "fallback_threshold": fallback_threshold,
                 "static_threshold": fallback_threshold,
@@ -1185,11 +1362,23 @@ class DirectPrometheusAnomalyRunner:
                 "score_buffer_size": score_buffer_size_after_append,
                 "score_buffer_size_before_decision": history_size,
                 "score_buffer_size_after_append": score_buffer_size_after_append,
-                "score_over_threshold": anomaly_score - final_threshold,
+                "score_over_threshold": smoothed_score - final_threshold,
                 "z_score": z_score,
                 "z_score_reason": z_score_reason,
                 "significant_feature_shift": bool(significant_feature_shift),
+                "recent_volatility": recent_volatility,
+                "recent_volatility_mean": volatility_mean,
+                "recent_volatility_std": volatility_std,
+                "recent_volatility_sample_size": int(volatility_sample_size),
+                "volatility_band": adaptive_profile.band,
+                "adaptive_threshold_percentile": float(adaptive_profile.threshold_percentile),
+                "adaptive_consecutive_windows": int(adaptive_profile.consecutive_windows),
+                "adaptive_smoothing_window": int(adaptive_profile.smoothing_window),
+                "adaptive_cooldown_windows": int(adaptive_profile.cooldown_windows),
+                "adaptive_cooldown_seconds": int(adaptive_cooldown_seconds),
+                "current_consecutive_breach_count": int(consecutive_breach_count),
                 "decision_reason": decision_reason,
+                "alert_suppressed_reason": cooldown_reason if status == "suppressed" else None,
                 "top_k_features": top_k_features,
                 "top_k_feature_errors": top_k_feature_errors,
                 "feature_error_vector": feature_error_vector,
@@ -1255,15 +1444,6 @@ class DirectPrometheusAnomalyRunner:
             "severity": str(severity),
             "explanation": str(explanation),
             "recommended_action": str(recommended_action),
-        }
-
-    def build_model_candidate_decision(self, result: dict[str, Any]) -> dict[str, Any]:
-        return {
-            **result,
-            "label": "model_candidate",
-            "severity": "unknown",
-            "explanation": "",
-            "recommended_action": "monitor",
         }
 
     def send_telegram_alert(self, decision: dict[str, Any]) -> tuple[bool, str | None]:
@@ -1337,6 +1517,7 @@ class DirectPrometheusAnomalyRunner:
             "timestamp": now_iso(),
             "entity_id": decision.get("entity_id"),
             "anomaly_score": decision.get("anomaly_score"),
+            "smoothed_score": decision.get("smoothed_score"),
             "threshold": decision.get("threshold"),
             "fallback_threshold": decision.get("fallback_threshold"),
             "static_threshold": decision.get("static_threshold"),
@@ -1347,6 +1528,13 @@ class DirectPrometheusAnomalyRunner:
             "score_buffer_size": decision.get("score_buffer_size"),
             "z_score": decision.get("z_score"),
             "z_score_reason": decision.get("z_score_reason"),
+            "recent_volatility": decision.get("recent_volatility"),
+            "volatility_band": decision.get("volatility_band"),
+            "adaptive_threshold_percentile": decision.get("adaptive_threshold_percentile"),
+            "adaptive_consecutive_windows": decision.get("adaptive_consecutive_windows"),
+            "adaptive_smoothing_window": decision.get("adaptive_smoothing_window"),
+            "adaptive_cooldown_windows": decision.get("adaptive_cooldown_windows"),
+            "current_consecutive_breach_count": decision.get("current_consecutive_breach_count"),
             "decision_reason": decision.get("decision_reason"),
             "alert_suppressed_reason": decision.get("alert_suppressed_reason"),
             "top_features": decision.get("top_k_features", []),
@@ -1365,6 +1553,7 @@ class DirectPrometheusAnomalyRunner:
             "container_id": decision.get("container_id"),
             "machine_id": decision.get("machine_id"),
             "anomaly_score": decision.get("anomaly_score"),
+            "smoothed_score": decision.get("smoothed_score"),
             "threshold": decision.get("threshold"),
             "fallback_threshold": decision.get("fallback_threshold"),
             "static_threshold": decision.get("static_threshold"),
@@ -1375,6 +1564,13 @@ class DirectPrometheusAnomalyRunner:
             "score_buffer_size": decision.get("score_buffer_size"),
             "z_score": decision.get("z_score"),
             "z_score_reason": decision.get("z_score_reason"),
+            "recent_volatility": decision.get("recent_volatility"),
+            "volatility_band": decision.get("volatility_band"),
+            "adaptive_threshold_percentile": decision.get("adaptive_threshold_percentile"),
+            "adaptive_consecutive_windows": decision.get("adaptive_consecutive_windows"),
+            "adaptive_smoothing_window": decision.get("adaptive_smoothing_window"),
+            "adaptive_cooldown_windows": decision.get("adaptive_cooldown_windows"),
+            "current_consecutive_breach_count": decision.get("current_consecutive_breach_count"),
             "decision_reason": decision.get("decision_reason"),
             "alert_suppressed_reason": decision.get("alert_suppressed_reason"),
             "status": status,
@@ -1406,6 +1602,7 @@ class DirectPrometheusAnomalyRunner:
             "container_id": decision.get("container_id"),
             "machine_id": decision.get("machine_id"),
             "anomaly_score": decision.get("anomaly_score"),
+            "smoothed_score": decision.get("smoothed_score"),
             "threshold": decision.get("threshold"),
             "fallback_threshold": decision.get("fallback_threshold"),
             "static_threshold": decision.get("static_threshold"),
@@ -1416,6 +1613,13 @@ class DirectPrometheusAnomalyRunner:
             "score_buffer_size": decision.get("score_buffer_size"),
             "z_score": decision.get("z_score"),
             "z_score_reason": decision.get("z_score_reason"),
+            "recent_volatility": decision.get("recent_volatility"),
+            "volatility_band": decision.get("volatility_band"),
+            "adaptive_threshold_percentile": decision.get("adaptive_threshold_percentile"),
+            "adaptive_consecutive_windows": decision.get("adaptive_consecutive_windows"),
+            "adaptive_smoothing_window": decision.get("adaptive_smoothing_window"),
+            "adaptive_cooldown_windows": decision.get("adaptive_cooldown_windows"),
+            "current_consecutive_breach_count": decision.get("current_consecutive_breach_count"),
             "decision_reason": decision.get("decision_reason"),
             "alert_suppressed_reason": decision.get("alert_suppressed_reason"),
             "label": decision.get("label"),
@@ -1432,6 +1636,7 @@ class DirectPrometheusAnomalyRunner:
             "timestamp": now_iso(),
             "entity_id": window_result.get("entity_id"),
             "score": window_result.get("anomaly_score"),
+            "smoothed_score": window_result.get("smoothed_score"),
             "fallback_threshold": window_result.get("fallback_threshold"),
             "static_threshold": window_result.get("static_threshold"),
             "fixed_threshold": window_result.get("fixed_threshold"),
@@ -1444,6 +1649,17 @@ class DirectPrometheusAnomalyRunner:
             "adaptive_threshold_ready": window_result.get("adaptive_threshold_ready"),
             "z_score": window_result.get("z_score"),
             "z_score_reason": window_result.get("z_score_reason"),
+            "recent_volatility": window_result.get("recent_volatility"),
+            "recent_volatility_mean": window_result.get("recent_volatility_mean"),
+            "recent_volatility_std": window_result.get("recent_volatility_std"),
+            "recent_volatility_sample_size": window_result.get("recent_volatility_sample_size"),
+            "volatility_band": window_result.get("volatility_band"),
+            "adaptive_threshold_percentile": window_result.get("adaptive_threshold_percentile"),
+            "adaptive_consecutive_windows": window_result.get("adaptive_consecutive_windows"),
+            "adaptive_smoothing_window": window_result.get("adaptive_smoothing_window"),
+            "adaptive_cooldown_windows": window_result.get("adaptive_cooldown_windows"),
+            "adaptive_cooldown_seconds": window_result.get("adaptive_cooldown_seconds"),
+            "current_consecutive_breach_count": window_result.get("current_consecutive_breach_count"),
             "top_k_features": window_result.get("top_k_features", []),
             "top_k_feature_errors": window_result.get("top_k_feature_errors", []),
             "rolling_score_min": window_result.get("rolling_score_min"),
@@ -1484,10 +1700,17 @@ class DirectPrometheusAnomalyRunner:
         print(
             f"[{prefix}] {result.get('entity_id', 'unknown')} | "
             f"score={format_metric_value(result.get('anomaly_score'))} | "
+            f"smoothed={format_metric_value(result.get('smoothed_score'))} | "
             f"static={format_metric_value(result.get('static_threshold', result.get('fallback_threshold')))} | "
             f"dynamic={format_metric_value(result.get('dynamic_threshold'))} | "
             f"final={format_metric_value(result.get('final_threshold'))} | "
             f"{z_fragment} | "
+            f"vol={format_metric_value(result.get('recent_volatility'), precision=4)} | "
+            f"band={result.get('volatility_band', 'unknown')} | "
+            f"pctl={format_metric_value(result.get('adaptive_threshold_percentile'), precision=2)} | "
+            f"hits={int(result.get('current_consecutive_breach_count', 0))}/{int(result.get('adaptive_consecutive_windows', 0))} | "
+            f"smooth_w={int(result.get('adaptive_smoothing_window', 0))} | "
+            f"cooldown_w={int(result.get('adaptive_cooldown_windows', 0))} | "
             f"buffer={int(result.get('score_buffer_size', 0))} | "
             f"mode={result.get('threshold_mode', 'unknown')} | "
             f"reason={result.get('decision_reason', 'unknown')}"
@@ -1495,8 +1718,24 @@ class DirectPrometheusAnomalyRunner:
 
     def handle_ready_result(self, result: dict[str, Any], time_stamp: int) -> None:
         entity_id = str(result["entity_id"])
+        status = str(result.get("status", "normal") or "normal")
 
-        if int(result.get("predicted_label", 0)) != 1:
+        if status == "normal":
+            self.emit_result_line("NORMAL", result)
+            return
+        if status == "candidate":
+            self.emit_result_line("CANDIDATE", result)
+            return
+        if status == "suppressed":
+            self.emit_result_line("SUPPRESSED", result)
+            if result.get("alert_suppressed_reason") and self.should_print_skip(
+                entity_id,
+                str(result.get("alert_suppressed_reason")),
+                time_stamp,
+            ):
+                print(f"[SUPPRESS] {entity_id} | reason={result.get('alert_suppressed_reason')}")
+            return
+        if status != "confirmed_anomaly" or int(result.get("predicted_label", 0)) != 1:
             self.emit_result_line("NORMAL", result)
             return
 
@@ -1520,31 +1759,12 @@ class DirectPrometheusAnomalyRunner:
             )
             return
 
-        self.emit_result_line("CANDIDATE", result)
-
-        window_id = int(result.get("window_id", -1))
-        pre_gpt_decision = self.build_model_candidate_decision(result)
-        cooldown_active, cooldown_reason = self.cooldown_status(entity_id, time_stamp, window_id, pre_gpt_decision)
-        if cooldown_active:
-            result["alert_suppressed_reason"] = cooldown_reason
-            if self.should_print_skip(entity_id, str(cooldown_reason), time_stamp):
-                print(f"[SUPPRESS] {entity_id} | reason={cooldown_reason} | gpt_skipped")
-            self.log_gpt_response(pre_gpt_decision, status="cooldown_skipped_before_gpt")
-            if ENABLE_GPT_LOGGING:
-                self.log_gpt_decision(pre_gpt_decision, telegram_sent=False)
-            return
+        self.emit_result_line("CONFIRMED", result)
 
         decision, gpt_error = self.adjudicate_with_gpt(result)
         if decision is None:
             fallback_decision = self.build_gpt_failure_telegram_payload(result, str(gpt_error))
             self.log_gpt_response(fallback_decision, status="gpt_failed_fallback")
-            cooldown_active, cooldown_reason = self.cooldown_status(entity_id, time_stamp, window_id, fallback_decision)
-            if cooldown_active:
-                fallback_decision["alert_suppressed_reason"] = cooldown_reason
-                if self.should_print_skip(entity_id, str(cooldown_reason), time_stamp):
-                    print(f"[SUPPRESS] {entity_id} | reason={cooldown_reason}")
-            else:
-                self.record_alert_state(entity_id, time_stamp, window_id, fallback_decision)
             self.deliver_telegram_result(
                 fallback_decision,
                 entity_id=entity_id,
@@ -1575,13 +1795,6 @@ class DirectPrometheusAnomalyRunner:
                 self.log_gpt_decision(decision, telegram_sent=False)
             return
 
-        cooldown_active, cooldown_reason = self.cooldown_status(entity_id, time_stamp, window_id, decision)
-        if cooldown_active:
-            decision["alert_suppressed_reason"] = cooldown_reason
-            if self.should_print_skip(entity_id, str(cooldown_reason), time_stamp):
-                print(f"[SUPPRESS] {entity_id} | reason={cooldown_reason}")
-        else:
-            self.record_alert_state(entity_id, time_stamp, window_id, decision)
         self.deliver_telegram_result(
             decision,
             entity_id=entity_id,
@@ -1633,6 +1846,18 @@ class DirectPrometheusAnomalyRunner:
             f"min_buffer={ROLLING_SCORE_MIN_BUFFER}, "
             f"zscore={ENABLE_ZSCORE_CANDIDATE}, "
             f"feature_shift={ENABLE_FEATURE_SHIFT_CANDIDATE}"
+        )
+        print(
+            "Adaptive decision bands: "
+            f"lookback={VOLATILITY_LOOKBACK}, "
+            f"low<{VOLATILITY_LOW_MAX:.4f}, "
+            f"high>={VOLATILITY_HIGH_MIN:.4f}, "
+            f"low=(p{LOW_VOLATILITY_PROFILE.threshold_percentile:.1f},hits={LOW_VOLATILITY_PROFILE.consecutive_windows},"
+            f"smooth={LOW_VOLATILITY_PROFILE.smoothing_window},cooldown={LOW_VOLATILITY_PROFILE.cooldown_windows}w), "
+            f"medium=(p{MEDIUM_VOLATILITY_PROFILE.threshold_percentile:.1f},hits={MEDIUM_VOLATILITY_PROFILE.consecutive_windows},"
+            f"smooth={MEDIUM_VOLATILITY_PROFILE.smoothing_window},cooldown={MEDIUM_VOLATILITY_PROFILE.cooldown_windows}w), "
+            f"high=(p{HIGH_VOLATILITY_PROFILE.threshold_percentile:.1f},hits={HIGH_VOLATILITY_PROFILE.consecutive_windows},"
+            f"smooth={HIGH_VOLATILITY_PROFILE.smoothing_window},cooldown={HIGH_VOLATILITY_PROFILE.cooldown_windows}w)"
         )
         print(f"Interval  : {self.config.poll_interval}s")
         while True:
