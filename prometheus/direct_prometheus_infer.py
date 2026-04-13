@@ -37,7 +37,7 @@ from evaluate import StreamingFiLMAnomalyDetector
 from gpt_adjudicator import (
     adjudicate_anomaly,
 )
-from model import build_model_from_checkpoint
+from live_infer import load_model_artifacts
 from telegram_utils import format_telegram_alert, send_telegram_message
 from utils import choose_device, ensure_directory
 
@@ -510,13 +510,15 @@ class DirectPrometheusAnomalyRunner:
             category_encoder=self.bundle["category_encoder"],
         )
         self.detector = StreamingFiLMAnomalyDetector(
-            model=self.bundle["model"],
+            reconstruction_model=self.bundle["reconstruction_model"],
+            forecasting_model=self.bundle["forecasting_model"],
             x_scaler=self.bundle["x_scaler"],
             c_scaler=self.bundle["c_scaler"],
             detector_meta=self.bundle["detector_meta"],
             feature_names=self.bundle["feature_columns"],
             top_k_features=config.top_k_features,
             device=self.resolved_device,
+            model_mode=self.bundle["mode"],
         )
 
         self.gpt_config = GPTConfig(
@@ -873,28 +875,21 @@ class DirectPrometheusAnomalyRunner:
         return self._default_category_metadata(context_columns)
 
     def _load_bundle(self, model_dir: Path, device: str) -> dict[str, Any]:
-        checkpoint = torch.load(model_dir / "film_ae.pt", map_location=device)
-        model = build_model_from_checkpoint(checkpoint, device=device)
-
-        x_scaler = joblib.load(model_dir / "x_scaler.joblib")
-        c_scaler = joblib.load(model_dir / "c_scaler.joblib")
-        detector_meta = joblib.load(model_dir / "detector_meta.joblib")
-        feature_columns = list(checkpoint["feature_columns"])
-        context_columns = list(checkpoint["context_columns"])
+        bundle = load_model_artifacts(model_dir=model_dir, device=device)
+        feature_columns = list(bundle["feature_columns"])
+        context_columns = list(bundle["context_columns"])
         category_metadata = self._load_category_metadata(model_dir, context_columns)
         categorical_columns = list(category_metadata.get("columns", []))
         numeric_columns = [column for column in context_columns if column not in categorical_columns]
-
-        return {
-            "model": model,
-            "x_scaler": x_scaler,
-            "c_scaler": c_scaler,
-            "detector_meta": detector_meta,
-            "feature_columns": feature_columns,
-            "numeric_context_columns": numeric_columns,
-            "categorical_context_columns": categorical_columns,
-            "category_encoder": CategoryEncoder(category_metadata),
-        }
+        bundle.update(
+            {
+                "feature_columns": feature_columns,
+                "numeric_context_columns": numeric_columns,
+                "categorical_context_columns": categorical_columns,
+                "category_encoder": CategoryEncoder(category_metadata),
+            }
+        )
+        return bundle
 
     def run_query(self, query: str) -> list[dict[str, Any]]:
         response = requests.get(
@@ -1183,6 +1178,7 @@ class DirectPrometheusAnomalyRunner:
             "entity_id": entity_id,
             "container_id": container,
             "machine_id": machine_id,
+            "mode": str(result.mode),
             "window_id": window_id,
             "window_ready": bool(result.ready),
             "threshold": fallback_threshold,
@@ -1227,6 +1223,9 @@ class DirectPrometheusAnomalyRunner:
             "history_already_existed": history_already_existed,
             "history_reinitialized": history_reinitialized,
             "history_restored_score_count": int(adaptive_state.restored_score_count),
+            "recon_score": None,
+            "forecast_score": None,
+            "final_score": None,
         }
 
         if not result.ready:
@@ -1244,6 +1243,8 @@ class DirectPrometheusAnomalyRunner:
 
         self.ready_window_counts[entity_id] = window_id + 1
         anomaly_score = float(result.anomaly_score or 0.0)
+        recon_score = float(result.recon_score) if result.recon_score is not None else None
+        forecast_score = float(result.forecast_score) if result.forecast_score is not None else None
         top_k_features = [str(value) for value in (result.top_k_features or [])]
         top_k_feature_errors = [float(value) for value in (result.top_k_feature_errors or [])]
         feature_error_vector = [float(value) for value in (result.feature_error_vector or [])]
@@ -1351,6 +1352,9 @@ class DirectPrometheusAnomalyRunner:
                 "anomaly_candidate": bool(anomaly_candidate),
                 "confirmed_anomaly": bool(confirmed_anomaly),
                 "anomaly_score": anomaly_score,
+                "recon_score": recon_score,
+                "forecast_score": forecast_score,
+                "final_score": anomaly_score,
                 "smoothed_score": smoothed_score,
                 "threshold": final_threshold,
                 "fallback_threshold": fallback_threshold,
@@ -1420,7 +1424,7 @@ class DirectPrometheusAnomalyRunner:
             "severity": "unknown",
             "explanation": "",
             "model_explanation": (
-                "FiLM autoencoder flagged this window before GPT adjudication. "
+                f"{str(result.get('mode', 'reconstruction')).title()} detector flagged this window before GPT adjudication. "
                 f"Candidate rule: {result.get('decision_reason', 'unknown')}"
             ),
             "recommended_action": (
@@ -1516,6 +1520,10 @@ class DirectPrometheusAnomalyRunner:
         payload = {
             "timestamp": now_iso(),
             "entity_id": decision.get("entity_id"),
+            "mode": decision.get("mode"),
+            "recon_score": decision.get("recon_score"),
+            "forecast_score": decision.get("forecast_score"),
+            "final_score": decision.get("final_score", decision.get("anomaly_score")),
             "anomaly_score": decision.get("anomaly_score"),
             "smoothed_score": decision.get("smoothed_score"),
             "threshold": decision.get("threshold"),
@@ -1550,6 +1558,10 @@ class DirectPrometheusAnomalyRunner:
         payload = {
             "timestamp": now_iso(),
             "entity_id": decision.get("entity_id"),
+            "mode": decision.get("mode"),
+            "recon_score": decision.get("recon_score"),
+            "forecast_score": decision.get("forecast_score"),
+            "final_score": decision.get("final_score", decision.get("anomaly_score")),
             "container_id": decision.get("container_id"),
             "machine_id": decision.get("machine_id"),
             "anomaly_score": decision.get("anomaly_score"),
@@ -1599,6 +1611,10 @@ class DirectPrometheusAnomalyRunner:
         payload = {
             "timestamp": now_iso(),
             "entity_id": decision.get("entity_id"),
+            "mode": decision.get("mode"),
+            "recon_score": decision.get("recon_score"),
+            "forecast_score": decision.get("forecast_score"),
+            "final_score": decision.get("final_score", decision.get("anomaly_score")),
             "container_id": decision.get("container_id"),
             "machine_id": decision.get("machine_id"),
             "anomaly_score": decision.get("anomaly_score"),
@@ -1635,6 +1651,10 @@ class DirectPrometheusAnomalyRunner:
         payload = {
             "timestamp": now_iso(),
             "entity_id": window_result.get("entity_id"),
+            "mode": window_result.get("mode"),
+            "recon_score": window_result.get("recon_score"),
+            "forecast_score": window_result.get("forecast_score"),
+            "final_score": window_result.get("final_score", window_result.get("anomaly_score")),
             "score": window_result.get("anomaly_score"),
             "smoothed_score": window_result.get("smoothed_score"),
             "fallback_threshold": window_result.get("fallback_threshold"),

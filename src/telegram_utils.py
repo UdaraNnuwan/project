@@ -37,6 +37,8 @@ def format_telegram_alert(record: dict[str, Any]) -> str:
         title,
     ]
 
+    mode = _first_nonempty(record, ["mode"], "reconstruction")
+    lines.append(f"Mode: {mode}")
     if "window_id" in record:
         lines.append(f"Window: {int(record.get('window_id', -1))}")
     if "entity_id" in record:
@@ -56,6 +58,12 @@ def format_telegram_alert(record: dict[str, Any]) -> str:
             f"Threshold: {float(record.get('threshold', 0.0)):.6f}",
         ]
     )
+    if record.get("recon_score") is not None:
+        lines.append(f"Recon score: {float(record.get('recon_score', 0.0)):.6f}")
+    if record.get("forecast_score") is not None:
+        lines.append(f"Forecast score: {float(record.get('forecast_score', 0.0)):.6f}")
+    if record.get("final_score") is not None:
+        lines.append(f"Final score: {float(record.get('final_score', 0.0)):.6f}")
     static_threshold = record.get(
         "static_threshold",
         record.get("fallback_threshold", record.get("fixed_threshold")),

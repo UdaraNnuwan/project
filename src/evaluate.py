@@ -7,92 +7,56 @@ import json
 from time import perf_counter
 from typing import Any
 
-import joblib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.metrics import average_precision_score, precision_recall_fscore_support, roc_auc_score
+from sklearn.metrics import (
+    ConfusionMatrixDisplay,
+    average_precision_score,
+    confusion_matrix,
+    precision_recall_curve,
+    precision_recall_fscore_support,
+    roc_auc_score,
+    roc_curve,
+)
 import torch
-from tqdm.auto import tqdm
 
 try:
     from config import EvalConfig, GPTConfig
     from gpt_adjudicator import adjudicate_anomaly, build_window_summary, compare_ae_vs_gpt_decisions
-    from model import build_model_from_checkpoint
-    from telegram_utils import format_telegram_alert, send_telegram_message
-    from utils import (
-        apply_3d_scaler,
-        build_prediction_frame,
-        choose_device,
-        compute_feature_error_matrix,
-        compute_window_scores,
-        ensure_directory,
-        safe_literal_list,
-        write_json,
+    from hybrid_scoring import (
+        available_modes,
+        combine_mode_scores,
+        compute_forecasting_outputs,
+        compute_reconstruction_outputs,
+        normalize_model_mode,
+        threshold_for_mode,
     )
+    from live_infer import StreamingHybridAnomalyDetector, load_model_artifacts
+    from telegram_utils import format_telegram_alert, send_telegram_message
+    from utils import apply_3d_scaler, build_prediction_frame, ensure_directory, safe_literal_list, write_json
 except ImportError:
     from .config import EvalConfig, GPTConfig
     from .gpt_adjudicator import adjudicate_anomaly, build_window_summary, compare_ae_vs_gpt_decisions
-    from .model import build_model_from_checkpoint
-    from .telegram_utils import format_telegram_alert, send_telegram_message
-    from .utils import (
-        apply_3d_scaler,
-        build_prediction_frame,
-        choose_device,
-        compute_feature_error_matrix,
-        compute_window_scores,
-        ensure_directory,
-        safe_literal_list,
-        write_json,
+    from .hybrid_scoring import (
+        available_modes,
+        combine_mode_scores,
+        compute_forecasting_outputs,
+        compute_reconstruction_outputs,
+        normalize_model_mode,
+        threshold_for_mode,
     )
+    from .live_infer import StreamingHybridAnomalyDetector, load_model_artifacts
+    from .telegram_utils import format_telegram_alert, send_telegram_message
+    from .utils import apply_3d_scaler, build_prediction_frame, ensure_directory, safe_literal_list, write_json
+
+
+StreamingFiLMAnomalyDetector = StreamingHybridAnomalyDetector
 
 
 def _eval_log(message: str, enabled: bool) -> None:
     if enabled:
-        tqdm.write(f"[evaluate] {message}")
-
-
-def load_artifacts(
-    dataset_dir: str | Path,
-    model_dir: str | Path,
-) -> dict[str, Any]:
-    dataset_path = Path(dataset_dir)
-    model_path = Path(model_dir)
-    checkpoint = torch.load(model_path / "film_ae.pt", map_location="cpu")
-    detector_meta = joblib.load(model_path / "detector_meta.joblib")
-    split_paths = {
-        "X_train": dataset_path / "X_train.npy",
-        "X_test": dataset_path / "X_test.npy",
-        "C_train": dataset_path / "C_train.npy",
-        "C_test": dataset_path / "C_test.npy",
-    }
-    if all(path.exists() for path in split_paths.values()):
-        x_train = np.load(split_paths["X_train"], mmap_mode="r")
-        x_test = np.load(split_paths["X_test"], mmap_mode="r")
-        c_train = np.load(split_paths["C_train"], mmap_mode="r")
-        c_test = np.load(split_paths["C_test"], mmap_mode="r")
-        return {
-            "X_train": x_train,
-            "X_test": x_test,
-            "C_train": c_train,
-            "C_test": c_test,
-            "metadata_train": _load_split_metadata(dataset_path, split="train", rows=int(x_train.shape[0])),
-            "metadata_test": _load_split_metadata(dataset_path, split="test", rows=int(x_test.shape[0])),
-            "feature_meta": joblib.load(dataset_path / "feature_meta.joblib"),
-            "checkpoint": checkpoint,
-            "x_scaler": joblib.load(model_path / "x_scaler.joblib"),
-            "c_scaler": joblib.load(model_path / "c_scaler.joblib"),
-            "detector_meta": detector_meta,
-        }
-    return {
-        "X": np.load(dataset_path / "X_all.npy", allow_pickle=False),
-        "C": np.load(dataset_path / "C_all.npy", allow_pickle=False),
-        "metadata": pd.read_csv(dataset_path / "window_metadata.csv"),
-        "feature_meta": joblib.load(dataset_path / "feature_meta.joblib"),
-        "checkpoint": checkpoint,
-        "x_scaler": joblib.load(model_path / "x_scaler.joblib"),
-        "c_scaler": joblib.load(model_path / "c_scaler.joblib"),
-        "detector_meta": detector_meta,
-    }
+        print(f"[evaluate] {message}")
 
 
 def _fallback_split_metadata(split: str, rows: int) -> pd.DataFrame:
@@ -116,6 +80,47 @@ def _load_split_metadata(dataset_path: Path, split: str, rows: int) -> pd.DataFr
     return _fallback_split_metadata(split=split, rows=rows)
 
 
+def load_artifacts(
+    dataset_dir: str | Path,
+    model_dir: str | Path,
+    model_mode: str | None = None,
+    device: str = "cpu",
+) -> dict[str, Any]:
+    dataset_path = Path(dataset_dir)
+    bundle = load_model_artifacts(model_dir=model_dir, device=device, model_mode=model_mode)
+    split_paths = {
+        "X_train": dataset_path / "X_train.npy",
+        "X_test": dataset_path / "X_test.npy",
+        "C_train": dataset_path / "C_train.npy",
+        "C_test": dataset_path / "C_test.npy",
+    }
+    if all(path.exists() for path in split_paths.values()):
+        x_train = np.load(split_paths["X_train"], mmap_mode="r")
+        x_test = np.load(split_paths["X_test"], mmap_mode="r")
+        c_train = np.load(split_paths["C_train"], mmap_mode="r")
+        c_test = np.load(split_paths["C_test"], mmap_mode="r")
+        bundle.update(
+            {
+                "X_train": x_train,
+                "X_test": x_test,
+                "C_train": c_train,
+                "C_test": c_test,
+                "metadata_train": _load_split_metadata(dataset_path, split="train", rows=int(x_train.shape[0])),
+                "metadata_test": _load_split_metadata(dataset_path, split="test", rows=int(x_test.shape[0])),
+            }
+        )
+        return bundle
+
+    bundle.update(
+        {
+            "X": np.load(dataset_path / "X_all.npy", allow_pickle=False),
+            "C": np.load(dataset_path / "C_all.npy", allow_pickle=False),
+            "metadata": pd.read_csv(dataset_path / "window_metadata.csv"),
+        }
+    )
+    return bundle
+
+
 def select_split(
     x_all: np.ndarray,
     c_all: np.ndarray,
@@ -129,36 +134,6 @@ def select_split(
         c_all[indices],
         metadata.iloc[indices].reset_index(drop=True),
     )
-
-
-def reconstruct_windows(
-    model: torch.nn.Module,
-    x_array: np.ndarray,
-    c_array: np.ndarray,
-    batch_size: int,
-    device: torch.device,
-    show_progress: bool = True,
-) -> np.ndarray:
-    predictions: list[np.ndarray] = []
-    total_batches = max(1, (len(x_array) + batch_size - 1) // batch_size)
-    progress = tqdm(
-        range(0, len(x_array), batch_size),
-        total=total_batches,
-        desc="Reconstructing windows",
-        unit="batch",
-        dynamic_ncols=True,
-        disable=not show_progress,
-    )
-    model.eval()
-    with torch.no_grad():
-        for start in progress:
-            end = start + batch_size
-            x_batch = torch.as_tensor(x_array[start:end], dtype=torch.float32, device=device)
-            c_batch = torch.as_tensor(c_array[start:end], dtype=torch.float32, device=device)
-            predictions.append(model(x_batch, c_batch).cpu().numpy())
-            progress.set_postfix(windows=min(end, len(x_array)))
-    progress.close()
-    return np.concatenate(predictions, axis=0)
 
 
 def inject_synthetic_anomalies(
@@ -179,7 +154,6 @@ def inject_synthetic_anomalies(
 
     target_events = max(1, int(len(injected) * anomaly_ratio / max(1, event_span)))
     event_id = 0
-
     eligible_groups = []
     for container_id, group in metadata.groupby("container_id", sort=False):
         group_indices = group.index.to_list()
@@ -243,17 +217,17 @@ def compute_binary_metrics(
         average="binary",
         zero_division=0,
     )
+    tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
     pr_auc = float(average_precision_score(labels, scores)) if labels.sum() > 0 else 0.0
-    if labels.sum() > 0 and len(np.unique(labels)) > 1:
-        roc_auc = float(roc_auc_score(labels, scores))
-    else:
-        roc_auc = 0.0
+    roc_auc = float(roc_auc_score(labels, scores)) if labels.sum() > 0 and len(np.unique(labels)) > 1 else 0.0
+    fpr = float(fp / max(1, fp + tn))
     return {
         "precision": float(precision),
         "recall": float(recall),
         "f1": float(f1),
         "pr_auc": pr_auc,
         "roc_auc": roc_auc,
+        "false_positive_rate": fpr,
     }
 
 
@@ -294,22 +268,173 @@ def compute_event_detection_metrics(
     }
 
 
-def build_realtime_alert_candidates(predictions: pd.DataFrame) -> pd.DataFrame:
-    candidate_time_columns = [
-        "end_time",
-        "window_end_time",
-        "ts_end",
-        "timestamp",
-        "window_id",
-    ]
-    sort_columns = [column for column in candidate_time_columns if column in predictions.columns]
-    if not sort_columns:
-        sort_columns = ["window_id"]
+def score_windows_for_mode(
+    bundle: dict[str, Any],
+    x_scaled: np.ndarray,
+    c_scaled: np.ndarray,
+    mode: str,
+    batch_size: int,
+    device: torch.device,
+    show_progress: bool,
+) -> dict[str, np.ndarray]:
+    normalized_mode = normalize_model_mode(mode)
+    recon_errors = None
+    recon_scores = None
+    forecast_errors = None
+    forecast_scores = None
 
-    realtime_stream = predictions.sort_values(sort_columns).reset_index(drop=True).copy()
-    realtime_stream["realtime_step"] = np.arange(len(realtime_stream))
-    realtime_stream["alert_ready"] = realtime_stream["predicted_label"] == 1
-    return realtime_stream
+    if normalized_mode in {"reconstruction", "hybrid"}:
+        recon_errors, recon_scores = compute_reconstruction_outputs(
+            model=bundle["reconstruction_model"],
+            x_scaled=x_scaled,
+            c_scaled=c_scaled,
+            batch_size=batch_size,
+            device=device,
+            show_progress=show_progress,
+        )
+    if normalized_mode in {"forecasting", "hybrid"}:
+        forecast_errors, forecast_scores = compute_forecasting_outputs(
+            model=bundle["forecasting_model"],
+            x_scaled=x_scaled,
+            c_scaled=c_scaled,
+            forecast_horizon=int(bundle["forecast_horizon"]),
+            batch_size=batch_size,
+            device=device,
+            show_progress=show_progress,
+        )
+
+    combined = combine_mode_scores(
+        mode=normalized_mode,
+        recon_feature_errors=recon_errors,
+        recon_scores=recon_scores,
+        forecast_feature_errors=forecast_errors,
+        forecast_scores=forecast_scores,
+        alpha=float(bundle["alpha"]),
+        beta=float(bundle["beta"]),
+    )
+    return {
+        "recon_scores": combined.recon_scores,
+        "forecast_scores": combined.forecast_scores,
+        "final_scores": combined.final_scores,
+        "recon_feature_errors": combined.recon_feature_errors,
+        "forecast_feature_errors": combined.forecast_feature_errors,
+        "final_feature_errors": combined.final_feature_errors,
+    }
+
+
+def apply_streaming_decision_logic(
+    prediction_frame: pd.DataFrame,
+    static_threshold: float,
+    config: EvalConfig,
+) -> pd.DataFrame:
+    sort_columns = [column for column in ("end_time", "window_id") if column in prediction_frame.columns]
+    frame = prediction_frame.sort_values(sort_columns or ["window_id"]).reset_index(drop=True).copy()
+    history: dict[str, deque[float]] = defaultdict(
+        lambda: deque(maxlen=max(10, int(config.dynamic_threshold_history_limit)))
+    )
+    smoothing_history: dict[str, deque[float]] = defaultdict(
+        lambda: deque(maxlen=max(1, int(config.smoothing_window)))
+    )
+    consecutive_counts: dict[str, int] = defaultdict(int)
+    cooldown_remaining: dict[str, int] = defaultdict(int)
+    rows: list[dict[str, Any]] = []
+
+    for _, row in frame.iterrows():
+        record = row.to_dict()
+        entity_id = str(record.get("container_id", record.get("entity_id", "unknown")))
+        score = float(record.get("final_score", record.get("anomaly_score", 0.0)))
+        score_history = history[entity_id]
+        smoothing_window = smoothing_history[entity_id]
+        smoothing_window.append(score)
+        smoothed_score = float(np.mean(np.asarray(smoothing_window, dtype=np.float32)))
+
+        dynamic_threshold = None
+        z_score = None
+        z_score_reason = None
+        history_values = np.asarray(score_history, dtype=np.float32)
+        if len(history_values) >= int(config.dynamic_threshold_min_history):
+            dynamic_threshold = float(np.percentile(history_values, float(config.dynamic_threshold_percentile)))
+            std = float(np.std(history_values))
+            if std > 1e-8:
+                z_score = float((score - float(np.mean(history_values))) / std)
+            else:
+                z_score_reason = "std_too_small"
+        else:
+            z_score_reason = f"warmup<{int(config.dynamic_threshold_min_history)}"
+
+        final_threshold = float(dynamic_threshold) if dynamic_threshold is not None else float(static_threshold)
+        threshold_mode = "dynamic" if dynamic_threshold is not None else "warmup"
+        threshold_hit = smoothed_score > final_threshold
+        z_score_hit = bool(
+            config.z_score_enabled
+            and z_score is not None
+            and z_score > float(config.z_score_threshold)
+        )
+
+        if threshold_hit:
+            consecutive_counts[entity_id] += 1
+        else:
+            consecutive_counts[entity_id] = 0
+        current_consecutive = int(consecutive_counts[entity_id])
+
+        decision_reason_parts: list[str] = []
+        if threshold_hit:
+            decision_reason_parts.append("smoothed_score_above_threshold")
+            decision_reason_parts.append(
+                f"consecutive_breach={current_consecutive}/{int(config.consecutive_breach_windows)}"
+            )
+        if z_score_hit:
+            decision_reason_parts.append(f"z_score>{float(config.z_score_threshold):.1f}")
+
+        if cooldown_remaining[entity_id] > 0 and (threshold_hit or z_score_hit):
+            status = "suppressed"
+            cooldown_remaining[entity_id] = max(0, cooldown_remaining[entity_id] - 1)
+            decision_reason_parts.append("cooldown_active")
+            consecutive_counts[entity_id] = 0
+            confirmed = False
+        elif threshold_hit and current_consecutive >= int(config.consecutive_breach_windows):
+            status = "confirmed_anomaly"
+            cooldown_remaining[entity_id] = int(config.cooldown_windows)
+            consecutive_counts[entity_id] = 0
+            decision_reason_parts.append("confirmed_after_consecutive_breaches")
+            confirmed = True
+        elif threshold_hit or z_score_hit:
+            status = "candidate"
+            confirmed = False
+        else:
+            status = "normal"
+            confirmed = False
+            if cooldown_remaining[entity_id] > 0:
+                cooldown_remaining[entity_id] = max(0, cooldown_remaining[entity_id] - 1)
+
+        score_history.append(score)
+        record.update(
+            {
+                "dynamic_threshold": dynamic_threshold,
+                "final_threshold": final_threshold,
+                "threshold": final_threshold,
+                "threshold_mode": threshold_mode,
+                "smoothed_score": smoothed_score,
+                "score_over_threshold": smoothed_score - final_threshold,
+                "z_score": z_score,
+                "z_score_reason": z_score_reason,
+                "current_consecutive_breach_count": current_consecutive,
+                "score_buffer_size": int(len(score_history)),
+                "decision": status,
+                "status": status,
+                "anomaly_candidate": bool(status in {"candidate", "confirmed_anomaly", "suppressed"}),
+                "confirmed_anomaly": bool(confirmed),
+                "predicted_label": int(confirmed),
+                "decision_reason": ",".join(decision_reason_parts) if decision_reason_parts else "below_all_candidate_rules",
+            }
+        )
+        rows.append(record)
+
+    return pd.DataFrame(rows)
+
+
+def json_dumps(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=True)
 
 
 def extract_compact_alert_payload(record: pd.Series | dict[str, Any]) -> dict[str, Any]:
@@ -319,17 +444,19 @@ def extract_compact_alert_payload(record: pd.Series | dict[str, Any]) -> dict[st
         "window_id": int(record.get("window_id", -1)),
         "container_id": str(record.get("container_id", "unknown")),
         "machine_id": str(record.get("machine_id", "unknown")),
-        "anomaly_score": float(record.get("anomaly_score", 0.0)),
+        "mode": str(record.get("mode", "reconstruction")),
+        "recon_score": record.get("recon_score"),
+        "forecast_score": record.get("forecast_score"),
+        "final_score": float(record.get("final_score", record.get("anomaly_score", 0.0))),
+        "anomaly_score": float(record.get("anomaly_score", record.get("final_score", 0.0))),
         "threshold": float(record.get("threshold", 0.0)),
+        "dynamic_threshold": record.get("dynamic_threshold"),
+        "final_threshold": record.get("final_threshold"),
         "top_k_features": safe_literal_list(record.get("top_k_features", [])),
         "top_k_feature_errors": safe_literal_list(record.get("top_k_feature_errors", [])),
         "feature_error_vector": safe_literal_list(record.get("feature_error_vector", [])),
         "score_over_threshold": float(record.get("score_over_threshold", 0.0)),
-        "container_app_du": str(record.get("container_app_du", "unknown")),
-        "container_status": str(record.get("container_status", "unknown")),
-        "machine_status": str(record.get("machine_status", "unknown")),
-        "machine_failure_domain_1": str(record.get("machine_failure_domain_1", "unknown")),
-        "machine_failure_domain_2": str(record.get("machine_failure_domain_2", "unknown")),
+        "decision_reason": str(record.get("decision_reason", "")),
         "start_time": int(record.get("start_time", -1)),
         "end_time": int(record.get("end_time", -1)),
         "split": str(record.get("split", "")),
@@ -338,40 +465,27 @@ def extract_compact_alert_payload(record: pd.Series | dict[str, Any]) -> dict[st
 
 def run_streaming_inference_flow(
     prediction_frame: pd.DataFrame,
+    config: EvalConfig,
     gpt_config: GPTConfig | None = None,
-    show_progress: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    realtime_stream = build_realtime_alert_candidates(prediction_frame)
-    stream_rows: list[dict[str, Any]] = []
-    gpt_rows: list[dict[str, Any]] = []
-    progress = tqdm(
-        realtime_stream.iterrows(),
-        total=len(realtime_stream),
-        desc="Streaming inference",
-        unit="window",
-        dynamic_ncols=True,
-        disable=not show_progress,
+    stream_df = apply_streaming_decision_logic(
+        prediction_frame=prediction_frame,
+        static_threshold=float(prediction_frame["static_threshold"].iloc[0]),
+        config=config,
     )
+    gpt_rows: list[dict[str, Any]] = []
+    stream_rows: list[dict[str, Any]] = []
 
-    for _, row in progress:
+    for _, row in stream_df.iterrows():
         record = row.to_dict()
         payload = extract_compact_alert_payload(record)
         summary = build_window_summary(payload)
-
-        stream_row = {
-            **record,
-            "gpt_triggered": False,
-            "gpt_label": None,
-            "gpt_severity": None,
-            "gpt_recommended_action": None,
-            "gpt_explanation": None,
-            "compact_anomaly_summary": json_dumps(summary),
-        }
-
-        if int(record.get("predicted_label", 0)) == 1 and gpt_config is not None:
+        record["compact_anomaly_summary"] = json_dumps(summary)
+        record["gpt_triggered"] = False
+        if record.get("decision") == "confirmed_anomaly" and gpt_config is not None:
             adjudicated = adjudicate_anomaly(payload, config=gpt_config)
             gpt_rows.append(adjudicated)
-            stream_row.update(
+            record.update(
                 {
                     "gpt_triggered": True,
                     "gpt_label": adjudicated["label"],
@@ -380,117 +494,125 @@ def run_streaming_inference_flow(
                     "gpt_explanation": adjudicated["explanation"],
                 }
             )
+        stream_rows.append(record)
 
-        stream_rows.append(stream_row)
-        progress.set_postfix(gpt=len(gpt_rows))
-
-    progress.close()
-    stream_df = pd.DataFrame(stream_rows)
+    stream_output = pd.DataFrame(stream_rows)
     gpt_df = pd.DataFrame(gpt_rows)
     comparison_df = compare_ae_vs_gpt_decisions(gpt_df)
-    return stream_df, gpt_df, comparison_df
-
-
-def json_dumps(payload: Any) -> str:
-    return json.dumps(payload, ensure_ascii=True)
+    return stream_output, gpt_df, comparison_df
 
 
 def send_telegram_notifications(
     alerts: pd.DataFrame,
     config: EvalConfig,
-    show_progress: bool = True,
 ) -> dict[str, Any]:
-    report = {
-        "enabled": bool(config.telegram_enabled),
-        "attempted": 0,
-        "sent": 0,
-        "failed": 0,
-        "reason": None,
-        "records": [],
-    }
+    report = {"enabled": bool(config.telegram_enabled), "attempted": 0, "sent": 0, "failed": 0, "records": []}
     if not config.telegram_enabled:
         report["reason"] = "disabled"
         return report
-
-    bot_token = config.telegram_bot_token
-    chat_id = config.telegram_chat_id
-    if not bot_token or not chat_id:
+    if not config.telegram_bot_token or not config.telegram_chat_id:
         report["reason"] = "missing_credentials"
         return report
 
-    selected_alerts = alerts.copy()
-    if bool(config.telegram_critical_only):
-        gpt_label = selected_alerts.get("gpt_label")
-        gpt_severity = selected_alerts.get("gpt_severity")
-        if gpt_label is not None or gpt_severity is not None:
-            selected_alerts = selected_alerts[
-                (
-                    selected_alerts.get("gpt_label", pd.Series("", index=selected_alerts.index)).fillna("").astype(str).str.lower()
-                    == "critical"
-                )
-                | (
-                    selected_alerts.get("gpt_severity", pd.Series("", index=selected_alerts.index)).fillna("").astype(str).str.lower()
-                    == "high"
-                )
-            ]
-        else:
-            selected_alerts = selected_alerts.iloc[0:0]
-
+    selected = alerts[alerts["decision"] == "confirmed_anomaly"].copy()
     if bool(config.telegram_require_gpt_reason):
-        selected_alerts = selected_alerts[
-            selected_alerts.get("gpt_explanation", pd.Series("", index=selected_alerts.index))
-            .fillna("")
-            .astype(str)
-            .str.strip()
-            .ne("")
+        selected = selected[
+            selected.get("gpt_explanation", pd.Series("", index=selected.index)).fillna("").astype(str).str.strip().ne("")
         ]
-
-    selected_alerts = selected_alerts.head(max(0, int(config.telegram_max_alerts))).reset_index(drop=True)
-    if selected_alerts.empty:
+    selected = selected.head(max(0, int(config.telegram_max_alerts))).reset_index(drop=True)
+    if selected.empty:
         report["reason"] = "no_matching_alerts"
         return report
 
-    progress = tqdm(
-        selected_alerts.iterrows(),
-        total=len(selected_alerts),
-        desc="Sending Telegram alerts",
-        unit="alert",
-        dynamic_ncols=True,
-        disable=not show_progress,
-    )
-
-    for _, row in progress:
-        record = row.to_dict()
+    for _, row in selected.iterrows():
         report["attempted"] += 1
-        try:
-            sent, body, error = send_telegram_message(
-                bot_token=bot_token,
-                chat_id=chat_id,
-                message_text=format_telegram_alert(record),
-                timeout_seconds=int(config.telegram_timeout_seconds),
-            )
-            if not sent:
-                raise RuntimeError(error or "telegram_send_failed")
+        sent, body, error = send_telegram_message(
+            bot_token=str(config.telegram_bot_token),
+            chat_id=str(config.telegram_chat_id),
+            message_text=format_telegram_alert(row.to_dict()),
+            timeout_seconds=int(config.telegram_timeout_seconds),
+        )
+        if sent:
             report["sent"] += 1
-            report["records"].append(
-                {
-                    "window_id": int(record.get("window_id", -1)),
-                    "status": "sent",
-                    "message_id": body.get("result", {}).get("message_id"),
-                }
-            )
-        except Exception as exc:
+            report["records"].append({"window_id": int(row.get("window_id", -1)), "status": "sent", "message_id": body.get("result", {}).get("message_id")})
+        else:
             report["failed"] += 1
-            report["records"].append(
-                {
-                    "window_id": int(record.get("window_id", -1)),
-                    "status": "failed",
-                    "error": str(exc),
-                }
-            )
-        progress.set_postfix(sent=report["sent"], failed=report["failed"])
-    progress.close()
+            report["records"].append({"window_id": int(row.get("window_id", -1)), "status": "failed", "error": error})
     return report
+
+
+def _save_binary_plots(mode_dir: Path, labels: np.ndarray, predictions: np.ndarray, scores: np.ndarray) -> dict[str, str]:
+    paths: dict[str, str] = {}
+
+    fig, ax = plt.subplots(figsize=(4, 4))
+    ConfusionMatrixDisplay(confusion_matrix(labels, predictions, labels=[0, 1]), display_labels=["normal", "anomaly"]).plot(ax=ax, colorbar=False)
+    ax.set_title("Confusion Matrix")
+    fig.tight_layout()
+    confusion_path = mode_dir / "confusion_matrix.png"
+    fig.savefig(confusion_path, dpi=150)
+    plt.close(fig)
+    paths["confusion_matrix"] = str(confusion_path.resolve())
+
+    if labels.sum() > 0 and len(np.unique(labels)) > 1:
+        fpr, tpr, _ = roc_curve(labels, scores)
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.plot(fpr, tpr, label="ROC")
+        ax.plot([0, 1], [0, 1], linestyle="--", color="grey")
+        ax.set_title("ROC Curve")
+        ax.set_xlabel("False Positive Rate")
+        ax.set_ylabel("True Positive Rate")
+        ax.legend()
+        fig.tight_layout()
+        roc_path = mode_dir / "roc_curve.png"
+        fig.savefig(roc_path, dpi=150)
+        plt.close(fig)
+        paths["roc_curve"] = str(roc_path.resolve())
+
+        precision, recall, _ = precision_recall_curve(labels, scores)
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.plot(recall, precision, label="PR")
+        ax.set_title("PR Curve")
+        ax.set_xlabel("Recall")
+        ax.set_ylabel("Precision")
+        ax.legend()
+        fig.tight_layout()
+        pr_path = mode_dir / "pr_curve.png"
+        fig.savefig(pr_path, dpi=150)
+        plt.close(fig)
+        paths["pr_curve"] = str(pr_path.resolve())
+
+    return paths
+
+
+def _save_score_plots(mode_dir: Path, stream_df: pd.DataFrame) -> dict[str, str]:
+    paths: dict[str, str] = {}
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(stream_df.index, stream_df["final_score"], label="score")
+    ax.plot(stream_df.index, stream_df["final_threshold"], label="dynamic_threshold")
+    ax.set_title("Score vs Dynamic Threshold")
+    ax.set_xlabel("Window Order")
+    ax.set_ylabel("Score")
+    ax.legend()
+    fig.tight_layout()
+    score_path = mode_dir / "score_vs_threshold.png"
+    fig.savefig(score_path, dpi=150)
+    plt.close(fig)
+    paths["score_vs_threshold"] = str(score_path.resolve())
+
+    if {"recon_score", "forecast_score"}.issubset(stream_df.columns):
+        fig, ax = plt.subplots(figsize=(5, 5))
+        ax.scatter(stream_df["recon_score"], stream_df["forecast_score"], s=8, alpha=0.5)
+        ax.set_title("Reconstruction vs Forecast Score")
+        ax.set_xlabel("Recon score")
+        ax.set_ylabel("Forecast score")
+        fig.tight_layout()
+        scatter_path = mode_dir / "recon_vs_forecast.png"
+        fig.savefig(scatter_path, dpi=150)
+        plt.close(fig)
+        paths["recon_vs_forecast"] = str(scatter_path.resolve())
+
+    return paths
 
 
 def evaluate_model(
@@ -503,45 +625,30 @@ def evaluate_model(
         gpt_config = GPTConfig(output_dir=config.output_dir, evaluation_dir=config.output_dir)
 
     output_dir = ensure_directory(config.output_dir)
-    resolved_device = choose_device(config.device)
-    _eval_log(
-        (
-            f"Starting evaluation: split={config.split}, device={resolved_device}, "
-            f"synthetic_injection={config.use_synthetic_injection}, "
-            f"gpt_stream={config.include_gpt_in_stream}, telegram={config.telegram_enabled}"
-        ),
-        enabled=config.verbose,
-    )
+    bundle = load_artifacts(config.dataset_dir, config.model_dir, model_mode=config.model_mode, device=config.device)
+    available = [
+        normalize_model_mode(mode)
+        for mode in config.eval_modes
+        if mode in available_modes(bundle["detector_meta"]) or (mode == "hybrid" and {"reconstruction", "forecasting"}.issubset(set(available_modes(bundle["detector_meta"]))))
+    ]
+    if not available:
+        available = [normalize_model_mode(config.model_mode)]
 
-    bundle = load_artifacts(config.dataset_dir, config.model_dir)
     if "X_test" in bundle:
         if config.split == "train":
             x_split = bundle["X_train"]
             c_split = bundle["C_train"]
             metadata = bundle["metadata_train"]
-        elif config.split == "test":
+        else:
             x_split = bundle["X_test"]
             c_split = bundle["C_test"]
             metadata = bundle["metadata_test"]
-        else:
-            raise ValueError(
-                f"Split '{config.split}' is not available for split memmap datasets. "
-                "Use 'train' or 'test', or rebuild a legacy dataset with window_metadata.csv."
-            )
     else:
         x_split, c_split, metadata = select_split(bundle["X"], bundle["C"], bundle["metadata"], config.split)
-    feature_names = bundle["feature_meta"]["feature_columns"]
-    _eval_log(
-        f"Loaded split with {len(metadata)} windows and {len(feature_names)} features.",
-        enabled=config.verbose,
-    )
 
-    _eval_log("Scaling input features and context vectors.", enabled=config.verbose)
     x_scaled = apply_3d_scaler(bundle["x_scaler"], x_split)
     c_scaled = bundle["c_scaler"].transform(c_split).astype(np.float32)
-
     if config.use_synthetic_injection:
-        _eval_log("Injecting synthetic anomalies into evaluation windows.", enabled=config.verbose)
         x_eval, labels, event_ids, event_table = inject_synthetic_anomalies(
             x_scaled=x_scaled,
             metadata=metadata,
@@ -558,211 +665,122 @@ def evaluate_model(
         event_ids = np.full(len(x_scaled), -1, dtype=np.int32)
         event_table = pd.DataFrame(columns=["event_id"])
 
-    device = torch.device(resolved_device)
-    _eval_log("Running model reconstruction.", enabled=config.verbose)
-    model = build_model_from_checkpoint(bundle["checkpoint"], device=device)
-    predictions = reconstruct_windows(
-        model=model,
-        x_array=x_eval,
-        c_array=c_scaled,
-        batch_size=config.batch_size,
-        device=device,
-        show_progress=config.show_progress,
-    )
+    comparison_rows: list[dict[str, Any]] = []
+    mode_outputs: dict[str, dict[str, Any]] = {}
+    selected_mode_outputs: dict[str, Any] | None = None
+    device = torch.device(bundle["device"])
+    for mode in available:
+        _eval_log(f"Evaluating mode={mode}", enabled=config.verbose)
+        mode_dir = ensure_directory(output_dir / mode)
+        scored = score_windows_for_mode(
+            bundle=bundle,
+            x_scaled=x_eval,
+            c_scaled=c_scaled,
+            mode=mode,
+            batch_size=config.batch_size,
+            device=device,
+            show_progress=config.show_progress,
+        )
+        static_threshold = threshold_for_mode(bundle["detector_meta"], mode)
+        prediction_frame = build_prediction_frame(
+            metadata=metadata,
+            scores=scored["final_scores"],
+            threshold=static_threshold,
+            feature_errors=scored["final_feature_errors"],
+            feature_names=bundle["feature_columns"],
+            top_k=config.top_k_features,
+            labels=labels,
+            predicted_labels=(scored["final_scores"] > static_threshold).astype(np.int32),
+        )
+        prediction_frame["mode"] = mode
+        prediction_frame["recon_score"] = scored["recon_scores"].astype(float)
+        prediction_frame["forecast_score"] = scored["forecast_scores"].astype(float)
+        prediction_frame["final_score"] = scored["final_scores"].astype(float)
+        prediction_frame["anomaly_score"] = scored["final_scores"].astype(float)
+        prediction_frame["static_threshold"] = float(static_threshold)
+        prediction_frame["event_id"] = event_ids.astype(int)
 
-    _eval_log("Computing anomaly scores and threshold decisions.", enabled=config.verbose)
-    feature_errors = compute_feature_error_matrix(x_eval, predictions)
-    scores = compute_window_scores(feature_errors)
-    threshold = float(bundle["detector_meta"]["threshold"])
-    predicted_labels = (scores > threshold).astype(np.int32)
+        stream_df, gpt_df, comparison_df = run_streaming_inference_flow(
+            prediction_frame=prediction_frame,
+            config=config,
+            gpt_config=gpt_config if config.include_gpt_in_stream else None,
+        )
+        confirmed_alerts = stream_df[stream_df["decision"] == "confirmed_anomaly"].copy()
+        predicted_labels = stream_df["predicted_label"].to_numpy(dtype=np.int32)
+        metrics = compute_binary_metrics(labels, predicted_labels, stream_df["final_score"].to_numpy(dtype=np.float32))
+        event_metrics = compute_event_detection_metrics(
+            event_ids=event_ids,
+            predictions=predicted_labels,
+            relaxed_tolerance=config.relaxed_detection_tolerance,
+        )
+        plot_paths = {}
+        plot_paths.update(_save_binary_plots(mode_dir, labels, predicted_labels, stream_df["final_score"].to_numpy(dtype=np.float32)))
+        plot_paths.update(_save_score_plots(mode_dir, stream_df))
 
-    prediction_frame = build_prediction_frame(
-        metadata=metadata,
-        scores=scores,
-        threshold=threshold,
-        feature_errors=feature_errors,
-        feature_names=feature_names,
-        top_k=config.top_k_features,
-        labels=labels,
-        predicted_labels=predicted_labels,
-    )
-    prediction_frame["event_id"] = event_ids.astype(int)
+        prediction_frame.to_csv(mode_dir / "window_level_predictions.csv", index=False)
+        stream_df.to_csv(mode_dir / "realtime_stream_predictions.csv", index=False)
+        confirmed_alerts.to_csv(mode_dir / "realtime_alert_candidates.csv", index=False)
+        event_table.to_csv(mode_dir / "synthetic_events.csv", index=False)
+        write_json(mode_dir / "event_metrics.json", event_metrics)
+        if not gpt_df.empty:
+            gpt_df.to_csv(mode_dir / "streaming_gpt_decisions.csv", index=False)
+            comparison_df.to_csv(mode_dir / "ae_vs_gpt_comparison.csv", index=False)
 
-    _eval_log("Simulating realtime stream and optional GPT adjudication.", enabled=config.verbose)
-    stream_df, gpt_df, comparison_df = run_streaming_inference_flow(
-        prediction_frame=prediction_frame,
-        gpt_config=gpt_config if config.include_gpt_in_stream else None,
-        show_progress=config.show_progress,
-    )
-    realtime_alerts = stream_df[stream_df["alert_ready"]].copy()
+        summary = {
+            "mode": mode,
+            "static_threshold": float(static_threshold),
+            "num_windows": int(len(prediction_frame)),
+            "num_positive_windows": int(labels.sum()),
+            "num_confirmed_alerts": int(len(confirmed_alerts)),
+            "num_gpt_decisions": int(len(gpt_df)),
+            **metrics,
+            "event_metrics": event_metrics,
+            "plots": plot_paths,
+        }
+        write_json(mode_dir / "evaluation_summary.json", summary)
+        comparison_rows.append(summary)
+        mode_outputs[mode] = {
+            "prediction_frame": prediction_frame,
+            "stream_df": stream_df,
+            "gpt_df": gpt_df,
+            "comparison_df": comparison_df,
+            "summary": summary,
+            "mode_dir": mode_dir,
+        }
 
-    metrics = compute_binary_metrics(labels, predicted_labels, scores)
-    event_metrics = compute_event_detection_metrics(
-        event_ids=event_ids,
-        predictions=predicted_labels,
-        relaxed_tolerance=config.relaxed_detection_tolerance,
-    )
+        if mode == normalize_model_mode(config.model_mode):
+            selected_mode_outputs = mode_outputs[mode]
 
-    evaluation_summary = {
-        "threshold": threshold,
-        **metrics,
-        "num_windows": int(len(prediction_frame)),
-        "num_positive_windows": int(labels.sum()),
-        "num_realtime_alerts": int(len(realtime_alerts)),
-        "num_gpt_decisions": int(len(gpt_df)),
-        "split": config.split,
-    }
-    _eval_log(
-        (
-            f"Detected {int(predicted_labels.sum())} anomalous windows at threshold {threshold:.6f}. "
-            f"Realtime alerts={len(realtime_alerts)}, GPT decisions={len(gpt_df)}."
-        ),
-        enabled=config.verbose,
-    )
+    if selected_mode_outputs is None:
+        selected_mode_outputs = mode_outputs.get(available[0]) if available else None
+    if selected_mode_outputs is None:
+        raise RuntimeError("No evaluation outputs were produced.")
 
-    prediction_csv_path = output_dir / "window_level_predictions.csv"
-    top_windows_path = output_dir / "top_anomalous_windows.csv"
-    realtime_stream_path = output_dir / "realtime_stream_predictions.csv"
-    realtime_alerts_path = output_dir / "realtime_alert_candidates.csv"
-    streaming_gpt_path = output_dir / "streaming_gpt_decisions.csv"
-    comparison_csv_path = output_dir / "ae_vs_gpt_comparison.csv"
-    comparison_json_path = output_dir / "ae_vs_gpt_comparison.json"
-    event_metrics_path = output_dir / "event_metrics.json"
-    summary_path = output_dir / "evaluation_summary.json"
-    telegram_report_path = output_dir / "telegram_notifications.json"
+    telegram_report = send_telegram_notifications(selected_mode_outputs["stream_df"], config)
+    write_json(output_dir / "telegram_notifications.json", telegram_report)
+    comparison_table = pd.DataFrame(comparison_rows).sort_values("f1", ascending=False)
+    comparison_table.to_csv(output_dir / "mode_comparison.csv", index=False)
+    write_json(output_dir / "evaluation_summary.json", {"selected_mode": config.model_mode, "modes": comparison_rows, "telegram_report": telegram_report})
+    write_json(output_dir / "event_metrics.json", selected_mode_outputs["summary"]["event_metrics"])
 
-    prediction_frame.to_csv(prediction_csv_path, index=False)
-    prediction_frame.sort_values("anomaly_score", ascending=False).head(100).to_csv(top_windows_path, index=False)
-    stream_df.to_csv(realtime_stream_path, index=False)
-    realtime_alerts.to_csv(realtime_alerts_path, index=False)
-    event_table.to_csv(output_dir / "synthetic_events.csv", index=False)
-    write_json(event_metrics_path, event_metrics)
+    selected_mode_outputs["prediction_frame"].to_csv(output_dir / "window_level_predictions.csv", index=False)
+    selected_mode_outputs["stream_df"].to_csv(output_dir / "realtime_stream_predictions.csv", index=False)
+    selected_mode_outputs["stream_df"][selected_mode_outputs["stream_df"]["decision"] == "confirmed_anomaly"].to_csv(output_dir / "realtime_alert_candidates.csv", index=False)
+    if not selected_mode_outputs["gpt_df"].empty:
+        selected_mode_outputs["gpt_df"].to_csv(output_dir / "streaming_gpt_decisions.csv", index=False)
+        selected_mode_outputs["comparison_df"].to_csv(output_dir / "ae_vs_gpt_comparison.csv", index=False)
 
-    if not gpt_df.empty:
-        gpt_df.to_csv(streaming_gpt_path, index=False)
-        comparison_df.to_csv(comparison_csv_path, index=False)
-        write_json(comparison_json_path, {"records": comparison_df.to_dict(orient="records")})
-
-    if config.telegram_enabled:
-        _eval_log("Sending Telegram notifications for selected alerts.", enabled=config.verbose)
-    telegram_report = send_telegram_notifications(
-        realtime_alerts,
-        config=config,
-        show_progress=config.show_progress,
-    )
-    write_json(telegram_report_path, telegram_report)
-    evaluation_summary["telegram_notifications_sent"] = int(telegram_report["sent"])
-    evaluation_summary["telegram_notifications_failed"] = int(telegram_report["failed"])
-    write_json(summary_path, evaluation_summary)
-    elapsed_seconds = perf_counter() - started_at
-    _eval_log(
-        (
-            f"Completed in {elapsed_seconds:.1f}s. "
-            f"F1={evaluation_summary['f1']:.4f}, PR-AUC={evaluation_summary['pr_auc']:.4f}, "
-            f"ROC-AUC={evaluation_summary['roc_auc']:.4f}."
-        ),
-        enabled=config.verbose,
-    )
-
+    _eval_log(f"Completed evaluation in {perf_counter() - started_at:.1f}s", enabled=config.verbose)
     return {
-        "prediction_csv": str(prediction_csv_path.resolve()),
-        "top_windows_csv": str(top_windows_path.resolve()),
-        "realtime_stream_csv": str(realtime_stream_path.resolve()),
-        "realtime_alerts_csv": str(realtime_alerts_path.resolve()),
-        "streaming_gpt_csv": str(streaming_gpt_path.resolve()) if streaming_gpt_path.exists() else None,
-        "comparison_csv": str(comparison_csv_path.resolve()) if comparison_csv_path.exists() else None,
-        "summary_json": str(summary_path.resolve()),
-        "event_metrics_json": str(event_metrics_path.resolve()),
-        "telegram_report_json": str(telegram_report_path.resolve()),
-        "evaluation_summary": evaluation_summary,
-        "event_metrics": event_metrics,
-        "telegram_report": telegram_report,
-        "streaming_frame": stream_df,
-        "gpt_frame": gpt_df,
+        "evaluation_summary": selected_mode_outputs["summary"],
+        "mode_comparison_csv": str((output_dir / "mode_comparison.csv").resolve()),
+        "summary_json": str((output_dir / "evaluation_summary.json").resolve()),
+        "event_metrics_json": str((output_dir / "event_metrics.json").resolve()),
+        "telegram_report_json": str((output_dir / "telegram_notifications.json").resolve()),
+        "streaming_frame": selected_mode_outputs["stream_df"],
+        "gpt_frame": selected_mode_outputs["gpt_df"],
+        "comparison_table": comparison_table,
     }
 
 
 evaluate_research_pipeline = evaluate_model
-
-
-@dataclass
-class StreamingInferenceResult:
-    entity_id: str
-    ready: bool
-    anomaly_score: float | None = None
-    threshold: float | None = None
-    predicted_label: int | None = None
-    top_k_features: list[str] | None = None
-    top_k_feature_errors: list[float] | None = None
-    feature_error_vector: list[float] | None = None
-    metadata: dict[str, Any] | None = None
-
-
-class StreamingFiLMAnomalyDetector:
-    """
-    Maintains sequential per-entity windows for near-real-time inference.
-
-    GPT is intentionally not called here. This class only produces the compact
-    anomaly summary that can be sent to the post-threshold adjudicator.
-    """
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        x_scaler: Any,
-        c_scaler: Any,
-        detector_meta: dict[str, Any],
-        feature_names: list[str],
-        top_k_features: int = 5,
-        device: str | torch.device = "cpu",
-    ) -> None:
-        self.model = model
-        self.x_scaler = x_scaler
-        self.c_scaler = c_scaler
-        self.threshold = float(detector_meta["threshold"])
-        self.window_size = int(detector_meta["window_size"])
-        self.feature_names = feature_names
-        self.top_k_features = int(top_k_features)
-        self.device = torch.device(device)
-        self.buffers: dict[str, deque[np.ndarray]] = defaultdict(lambda: deque(maxlen=self.window_size))
-
-    def update(
-        self,
-        entity_id: str,
-        feature_row: np.ndarray,
-        context_vector: np.ndarray,
-        metadata: dict[str, Any] | None = None,
-    ) -> StreamingInferenceResult:
-        buffer = self.buffers[str(entity_id)]
-        buffer.append(np.asarray(feature_row, dtype=np.float32))
-        if len(buffer) < self.window_size:
-            return StreamingInferenceResult(entity_id=str(entity_id), ready=False, metadata=metadata)
-
-        window = np.stack(list(buffer), axis=0)
-        window = np.log1p(np.clip(window, a_min=0.0, a_max=None)).astype(np.float32)
-        window_scaled = apply_3d_scaler(self.x_scaler, window[None, ...])
-        context_scaled = self.c_scaler.transform(
-            np.asarray(context_vector, dtype=np.float32).reshape(1, -1)
-        ).astype(np.float32)
-
-        with torch.no_grad():
-            reconstructed = self.model(
-                torch.as_tensor(window_scaled, dtype=torch.float32, device=self.device),
-                torch.as_tensor(context_scaled, dtype=torch.float32, device=self.device),
-            ).cpu().numpy()
-
-        feature_errors = compute_feature_error_matrix(window_scaled, reconstructed)[0]
-        score = float(compute_window_scores(feature_errors[None, ...])[0])
-        top_indices = np.argsort(feature_errors)[::-1][: self.top_k_features]
-        predicted_label = int(score > self.threshold)
-        return StreamingInferenceResult(
-            entity_id=str(entity_id),
-            ready=True,
-            anomaly_score=score,
-            threshold=self.threshold,
-            predicted_label=predicted_label,
-            top_k_features=[self.feature_names[index] for index in top_indices],
-            top_k_feature_errors=[float(feature_errors[index]) for index in top_indices],
-            feature_error_vector=[float(value) for value in feature_errors],
-            metadata=metadata or {},
-        )

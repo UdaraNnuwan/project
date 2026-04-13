@@ -1,129 +1,140 @@
-# Container Anomaly Detection Research Pipeline
+# Container Anomaly Detection Pipeline
 
-This project uses a FiLM-conditioned autoencoder as the core multivariate anomaly detector for Alibaba container telemetry. GPT is only used after anomaly score threshold crossing for interpretation, false-positive filtering, severity classification, and recommended action generation.
+This branch adds a selectable multivariate anomaly stack with three modes:
 
-## Notebook Entry Points
+- `reconstruction`: FiLM autoencoder reconstruction error
+- `forecasting`: GRU forecasting error on the next timestep / short horizon
+- `hybrid`: `ALPHA * recon_score + BETA * forecast_score`
 
-- `notebooks/00_quickstart_smoke.ipynb`: fastest runnable notebook using the tiny synthetic smoke dataset in `data/smoke_processed/`
-- `notebooks/01_build_dataset.ipynb` to `notebooks/04_gpt.ipynb`: research notebook flow using Alibaba raw archives and reduced research-smoke outputs
+GPT adjudication and Telegram alerts remain downstream of confirmed anomalies only.
 
-## Project Structure
+## Main Config
 
-```text
-project/
-|-- notebooks/
-|   |-- 00_quickstart_smoke.ipynb
-|   |-- 01_build_dataset.ipynb
-|   |-- 02_train.ipynb
-|   |-- 03_eval.ipynb
-|   `-- 04_gpt.ipynb
-|-- src/
-|   |-- dataset.py
-|   |-- model.py
-|   |-- train.py
-|   |-- evaluate.py
-|   |-- gpt_adjudicator.py
-|   |-- config.py
-|   |-- streaming_csv_train.py
-|   |-- streaming_train.py
-|   `-- utils.py
-|-- data/
-|-- models/
-|-- results/
-|-- generate_research_notebooks.py
-|-- README.md
-`-- .env
-```
-
-Quickstart artifacts live under `data/smoke_processed/`, `models/smoke/`, and `results/smoke/`.
-
-Research smoke artifacts live under `data/research_processed_smoke_auto/`, `models/research_smoke_auto/`, and `results/research_smoke_auto/`.
-
-## Pipeline
-
-1. `notebooks/00_quickstart_smoke.ipynb`
-   Uses the bundled tiny smoke dataset.
-   Retrains the notebook-friendly baseline on CPU.
-   Runs evaluation and writes outputs to `results/smoke/`.
-
-2. `notebooks/01_build_dataset.ipynb`
-   Loads `container_meta.tar.gz`, `container_usage.tar.gz`, `machine_meta.tar.gz`, and `machine_usage.tar.gz` directly from the Alibaba archives.
-   Cleans and aligns container and machine context.
-   Builds a larger chunked research dataset with a 10,000,000-row raw usage target and saves artifacts to `data/research_processed_smoke_auto/`.
-
-3. `notebooks/02_train.ipynb`
-   Loads `data/research_processed_smoke_auto/`.
-   Initializes the FiLM autoencoder from [`src/model.py`](/c:/Users/kaspe/Desktop/Project/project/src/model.py).
-   Runs training and validation, plots losses, fits the threshold, and saves checkpoints to `models/research_smoke_auto/`.
-
-4. `notebooks/03_eval.ipynb`
-   Loads the trained model.
-   Runs sequential inference in time order.
-   Computes anomaly scores, feature-wise reconstruction errors, top-k anomalous features, standard metrics, and strict/relaxed early-detection metrics.
-   Saves outputs to `results/research_smoke_auto/`.
-
-5. `notebooks/04_gpt.ipynb`
-   Loads threshold-crossing anomaly candidates from `results/research_smoke_auto/`.
-   Builds compact GPT inputs from anomaly score, top-k features, feature errors, and context.
-   Calls the OpenAI Responses API for structured JSON output.
-   Compares AE-only vs AE+GPT decisions and saves outputs to `results/research_smoke_auto/`.
-
-## Streaming Evaluation Flow
-
-`src/evaluate.py` includes a streaming-style time-ordered evaluation path:
-
-1. Process windows in timestamp order.
-2. Compute the FiLM autoencoder reconstruction score for each window.
-3. If `score > threshold`, extract top-k feature errors.
-4. Build a compact anomaly summary.
-5. Optionally send that summary to GPT.
-6. Store the GPT decision alongside the AE output.
-
-GPT never replaces anomaly detection. It only adjudicates threshold-crossing windows.
-
-## Environment
-
-The default raw archive location is `data/raw/`. Override it with:
+Use `MODEL_MODE` to select the scoring path:
 
 ```powershell
-$env:CONTAINER_AD_RAW_DATA_DIR="C:\path\to\raw\archives"
+$env:MODEL_MODE="reconstruction"
+$env:MODEL_MODE="forecasting"
+$env:MODEL_MODE="hybrid"
 ```
 
-Optional OpenAI settings:
+Hybrid weights are configurable:
+
+```powershell
+$env:ALPHA="0.6"
+$env:BETA="0.4"
+```
+
+Forecasting horizon is configurable:
+
+```powershell
+$env:FORECAST_HORIZON="1"
+```
+
+## Notebooks
+
+Run in this order:
+
+1. `notebooks/01_build_dataset.ipynb`
+2. `notebooks/02_train.ipynb`
+3. `notebooks/03_eval.ipynb`
+4. `notebooks/04_gpt.ipynb`
+
+`notebooks/01_build_dataset.ipynb` now writes both reconstruction windows and forecasting inputs/targets.
+
+`notebooks/02_train.ipynb` trains reconstruction, forecasting, and hybrid-ready artifacts.
+
+`notebooks/03_eval.ipynb` compares all three modes and writes:
+
+- precision
+- recall
+- F1
+- ROC-AUC
+- PR-AUC
+- false positive rate
+- score-vs-threshold plots
+- reconstruction-vs-forecast score plots
+- confusion matrix / ROC / PR curves
+
+`notebooks/04_gpt.ipynb` operates on confirmed anomalies only.
+
+## Code Layout
+
+- `src/model_reconstruction.py`: FiLM autoencoder
+- `src/model_forecasting.py`: GRU forecaster
+- `src/hybrid_scoring.py`: reconstruction / forecasting / hybrid score computation
+- `src/live_infer.py`: shared artifact loader and live streaming detector
+- `src/dataset.py`: dataset build plus forecasting targets
+- `src/train.py`: mode-aware training and threshold fitting
+- `src/evaluate.py`: three-mode evaluation, candidate/confirmed logic, GPT/Telegram hooks
+- `src/gpt_adjudicator.py`: GPT payloads now include mode and component scores
+- `src/telegram_utils.py`: Telegram alerts now include mode and hybrid score context
+- `prometheus/direct_prometheus_infer.py`: Prometheus live path with adaptive thresholds, consecutive confirmation, GPT, and Telegram
+- `product/inference_service.py`: live service path using the shared hybrid detector
+
+## Artifacts
+
+Training writes:
+
+- `reconstruction_model.pt`
+- `film_ae.pt` (legacy reconstruction-compatible name)
+- `forecasting_model.pt`
+- `x_scaler.joblib`
+- `c_scaler.joblib`
+- `detector_meta.json` / `detector_meta.joblib`
+- `threshold_config.json`
+
+Dataset build writes:
+
+- `X_train.npy`, `X_test.npy`
+- `C_train.npy`, `C_test.npy`
+- `X_forecast_train.npy`, `X_forecast_test.npy`
+- `y_forecast_train.npy`, `y_forecast_test.npy`
+
+## Live Behavior
+
+The live Prometheus path keeps:
+
+- per-entity rolling dynamic thresholds
+- candidate vs confirmed anomaly states
+- consecutive breach confirmation
+- smoothing
+- cooldown suppression
+- GPT calls only for confirmed anomalies
+- Telegram alerts only for confirmed anomalies
+
+Each logged decision includes mode, component scores, final score, thresholds, z-score context, volatility context, consecutive breach count, GPT status, and Telegram status.
+
+## GPT / Telegram
+
+Required env vars:
 
 ```powershell
 $env:OPENAI_API_KEY="..."
-$env:OPENAI_MODEL="gpt-5-mini-2025-08-07"
+$env:OPENAI_MODEL="gpt-4.1-mini"
+$env:TELEGRAM_BOT_TOKEN="..."
+$env:TELEGRAM_CHAT_ID="..."
 ```
 
-## Run
+GPT receives:
 
-Regenerate the notebooks if needed:
+- entity
+- mode
+- score / threshold context
+- top features
+- decision reason
+
+Telegram includes:
+
+- entity
+- mode
+- reconstruction / forecasting / final scores when available
+- threshold context
+- decision reason
+- GPT summary when available
+
+## Regenerate Notebooks
 
 ```powershell
 .\venv\Scripts\python.exe .\generate_research_notebooks.py
 ```
-
-Run the notebooks in order:
-
-1. `notebooks/00_quickstart_smoke.ipynb` for the fastest initial run
-2. `notebooks/01_build_dataset.ipynb`
-3. `notebooks/02_train.ipynb`
-4. `notebooks/03_eval.ipynb`
-5. `notebooks/04_gpt.ipynb`
-
-For raw-data training without writing intermediate processed datasets, use the streaming trainer in [`src/streaming_train.py`](/c:/Users/kaspe/Desktop/Project/project/src/streaming_train.py). It reads the raw archives in chunks, preprocesses each chunk in memory, carries only tail rows across chunk boundaries, fits online scalers in a separate pass, and trains directly from streamed sliding windows.
-
-For a direct single-CSV path with `pandas.read_csv(..., chunksize=...)`, use [`src/streaming_csv_train.py`](/c:/Users/kaspe/Desktop/Project/project/src/streaming_csv_train.py). It streams raw CSV chunks, preprocesses them entirely in memory, creates sliding windows on the fly, and feeds batches directly into training without intermediate CSV/parquet/npy outputs.
-
-## Core Modules
-
-- [`src/dataset.py`](/c:/Users/kaspe/Desktop/Project/project/src/dataset.py): raw archive loading, preprocessing, context creation, and sliding windows
-- [`src/model.py`](/c:/Users/kaspe/Desktop/Project/project/src/model.py): FiLM autoencoder
-- [`src/train.py`](/c:/Users/kaspe/Desktop/Project/project/src/train.py): training, validation, threshold fitting, checkpoint saving
-- [`src/evaluate.py`](/c:/Users/kaspe/Desktop/Project/project/src/evaluate.py): scoring, metrics, early detection, streaming-style post-threshold flow
-- [`src/gpt_adjudicator.py`](/c:/Users/kaspe/Desktop/Project/project/src/gpt_adjudicator.py): Responses API integration and structured JSON handling
-- [`src/config.py`](/c:/Users/kaspe/Desktop/Project/project/src/config.py): central configuration
-- [`src/streaming_csv_train.py`](/c:/Users/kaspe/Desktop/Project/project/src/streaming_csv_train.py): direct chunked CSV preprocessing, overlap-buffer windowing, iterable dataset, and streaming training
-- [`src/streaming_train.py`](/c:/Users/kaspe/Desktop/Project/project/src/streaming_train.py): chunked raw-data loader, in-memory preprocessing, iterable sliding-window dataset, and direct streaming training
-- [`src/utils.py`](/c:/Users/kaspe/Desktop/Project/project/src/utils.py): helper utilities

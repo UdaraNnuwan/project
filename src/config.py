@@ -54,6 +54,30 @@ def env_path(name: str, default: Path) -> Path:
     return Path(os.getenv(name, str(default))).expanduser().resolve()
 
 
+def env_str(name: str, default: str) -> str:
+    return str(os.getenv(name, default)).strip() or str(default)
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
 @dataclass
 class DatasetConfig:
     raw_data_dir: Path = field(
@@ -80,6 +104,9 @@ class DatasetConfig:
     container_limit: int | None = None
     window_size: int = WINDOW_SIZE
     stride: int = STRIDE
+    forecast_horizon: int = field(
+        default_factory=lambda: max(1, env_int("FORECAST_HORIZON", 1))
+    )
     train_ratio: float = TRAIN_SPLIT
     val_ratio: float = 0.0
     min_window_observed_ratio: float = 0.60
@@ -160,6 +187,7 @@ class TrainConfig:
             MODELS_DIR,
         )
     )
+    model_mode: str = field(default_factory=lambda: env_str("MODEL_MODE", "reconstruction"))
     batch_size: int = 128
     num_workers: int = 0
     epochs: int = 80
@@ -172,6 +200,20 @@ class TrainConfig:
     random_seed: int = 42
     units: int = 64
     latent: int = 64
+    forecast_horizon: int = field(
+        default_factory=lambda: max(1, env_int("FORECAST_HORIZON", 1))
+    )
+    forecast_hidden_size: int = field(
+        default_factory=lambda: env_int("FORECAST_HIDDEN_SIZE", 64)
+    )
+    forecast_num_layers: int = field(
+        default_factory=lambda: max(1, env_int("FORECAST_NUM_LAYERS", 1))
+    )
+    forecast_dropout: float = field(
+        default_factory=lambda: max(0.0, env_float("FORECAST_DROPOUT", 0.0))
+    )
+    alpha: float = field(default_factory=lambda: env_float("ALPHA", 0.6))
+    beta: float = field(default_factory=lambda: env_float("BETA", 0.4))
     score_mode: str = "mean_feature_mse"
     device: str = "cuda"
 
@@ -202,9 +244,40 @@ class EvalConfig:
             RESULTS_DIR,
         )
     )
+    model_mode: str = field(default_factory=lambda: env_str("MODEL_MODE", "reconstruction"))
+    eval_modes: tuple[str, ...] = ("reconstruction", "forecasting", "hybrid")
     split: str = "test"
     batch_size: int = 256
     top_k_features: int = 5
+    alpha: float = field(default_factory=lambda: env_float("ALPHA", 0.6))
+    beta: float = field(default_factory=lambda: env_float("BETA", 0.4))
+    forecast_horizon: int = field(
+        default_factory=lambda: max(1, env_int("FORECAST_HORIZON", 1))
+    )
+    dynamic_threshold_percentile: float = field(
+        default_factory=lambda: env_float("EVAL_DYNAMIC_THRESHOLD_PERCENTILE", 99.0)
+    )
+    dynamic_threshold_min_history: int = field(
+        default_factory=lambda: max(5, env_int("EVAL_DYNAMIC_THRESHOLD_MIN_HISTORY", 30))
+    )
+    dynamic_threshold_history_limit: int = field(
+        default_factory=lambda: max(10, env_int("EVAL_DYNAMIC_THRESHOLD_HISTORY_LIMIT", 200))
+    )
+    smoothing_window: int = field(
+        default_factory=lambda: max(1, env_int("EVAL_SMOOTHING_WINDOW", 3))
+    )
+    consecutive_breach_windows: int = field(
+        default_factory=lambda: max(1, env_int("EVAL_CONSECUTIVE_BREACH_WINDOWS", 3))
+    )
+    cooldown_windows: int = field(
+        default_factory=lambda: max(0, env_int("EVAL_COOLDOWN_WINDOWS", 2))
+    )
+    z_score_enabled: bool = field(
+        default_factory=lambda: env_str("EVAL_Z_SCORE_ENABLED", "true").lower() not in {"0", "false", "no"}
+    )
+    z_score_threshold: float = field(
+        default_factory=lambda: env_float("EVAL_Z_SCORE_THRESHOLD", 3.0)
+    )
     synthetic_anomaly_ratio: float = 0.08
     synthetic_event_span: int = 4
     synthetic_feature_count: int = 2

@@ -1,42 +1,90 @@
 {
   "model_dir": "C:\\Users\\kaspe\\Desktop\\Project\\project\\models\\research_smoke_auto",
-  "history_path": "C:\\Users\\kaspe\\Desktop\\Project\\project\\models\\research_smoke_auto\\training_history.csv",
-  "loss_curve_path": "C:\\Users\\kaspe\\Desktop\\Project\\project\\results\\loss_curve.png",
-  "model_path": "C:\\Users\\kaspe\\Desktop\\Project\\project\\models\\research_smoke_auto\\film_ae.pt",
+  "artifact_paths": {
+    "reconstruction_model": "C:\\Users\\kaspe\\Desktop\\Project\\project\\models\\research_smoke_auto\\reconstruction_model.pt",
+    "legacy_reconstruction_model": "C:\\Users\\kaspe\\Desktop\\Project\\project\\models\\research_smoke_auto\\film_ae.pt",
+    "forecasting_model": "C:\\Users\\kaspe\\Desktop\\Project\\project\\models\\research_smoke_auto\\forecasting_model.pt"
+  },
   "detector_meta": {
-    "threshold": 4.6121673583984375,
+    "default_mode": "hybrid",
+    "available_modes": [
+      "reconstruction",
+      "forecasting",
+      "hybrid"
+    ],
+    "threshold": 4.992697715759277,
+    "forecast_threshold": 5.878686428070068,
+    "hybrid_threshold": 5.061085224151611,
     "threshold_quantile": 0.995,
     "window_size": 30,
+    "forecast_horizon": 1,
+    "forecast_input_window_size": 29,
     "n_features": 8,
     "context_dim": 17,
     "score_mode": "mean_feature_mse",
-    "num_train_windows": 139011,
-    "num_val_windows": 15446,
-    "num_test_windows": 39160,
-    "best_val_loss": 0.5636702044345424,
-    "val_score_mean": 0.5636701583862305,
-    "val_score_std": 0.7434863448143005,
-    "test_split_rows": 39160
+    "num_train_windows": 69236,
+    "num_val_windows": 7693,
+    "num_test_windows": 19508,
+    "alpha": 0.6,
+    "beta": 0.4,
+    "modes": {
+      "reconstruction": {
+        "threshold": 4.992697715759277,
+        "artifact_path": "reconstruction_model.pt",
+        "best_val_loss": 0.6308933432516252,
+        "val_score_mean": 0.630893349647522,
+        "val_score_std": 0.8544265627861023
+      },
+      "forecasting": {
+        "threshold": 5.878686428070068,
+        "artifact_path": "forecasting_model.pt",
+        "best_val_loss": 0.5946482000883389,
+        "val_score_mean": 0.5946482419967651,
+        "val_score_std": 1.3696832656860352
+      },
+      "hybrid": {
+        "threshold": 5.061085224151611,
+        "val_score_mean": 0.6163952946662903,
+        "val_score_std": 0.9246206879615784,
+        "alpha": 0.6,
+        "beta": 0.4
+      }
+    }
   },
   "train_config": {
     "dataset_dir": "C:\\Users\\kaspe\\Desktop\\Project\\project\\data\\research_processed_smoke_auto",
     "model_dir": "C:\\Users\\kaspe\\Desktop\\Project\\project\\models\\research_smoke_auto",
+    "model_mode": "hybrid",
     "batch_size": 128,
     "num_workers": 0,
-    "epochs": 20,
+    "epochs": 10,
     "learning_rate": 0.001,
     "weight_decay": 1e-05,
-    "patience": 8,
+    "patience": 12,
     "lr_plateau_patience": 4,
     "lr_plateau_factor": 0.5,
     "threshold_quantile": 0.995,
     "random_seed": 42,
     "units": 64,
     "latent": 64,
+    "forecast_horizon": 1,
+    "forecast_hidden_size": 64,
+    "forecast_num_layers": 1,
+    "forecast_dropout": 0.0,
+    "alpha": 0.6,
+    "beta": 0.4,
     "score_mode": "mean_feature_mse",
-    "device": "cuda"
+    "device": "cpu"
   },
-  "train_split_rows": 139011,
-  "val_split_rows": 15446,
-  "test_split_rows": 39160
+  "train_split_rows": 69236,
+  "val_split_rows": 7693,
+  "test_split_rows": 19508,
+  "history_paths": {
+    "reconstruction": "C:\\Users\\kaspe\\Desktop\\Project\\project\\models\\research_smoke_auto\\reconstruction_training_history.csv",
+    "forecasting": "C:\\Users\\kaspe\\Desktop\\Project\\project\\models\\research_smoke_auto\\forecasting_training_history.csv"
+  },
+  "loss_curve_paths": {
+    "reconstruction": "C:\\Users\\kaspe\\Desktop\\Project\\project\\results\\reconstruction_loss_curve.png",
+    "forecasting": "C:\\Users\\kaspe\\Desktop\\Project\\project\\results\\forecasting_loss_curve.png"
+  }
 }

@@ -3,6 +3,7 @@ matplotlib
 numpy
 openai
 pandas
+python-telegram-bot
 python-dotenv
 requests
 scikit-learn

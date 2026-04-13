@@ -9,12 +9,10 @@ from typing import Any
 
 import joblib
 import numpy as np
-import torch
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-from evaluate import StreamingFiLMAnomalyDetector
-from model import build_model_from_checkpoint
+from live_infer import StreamingHybridAnomalyDetector, load_model_artifacts
 
 
 @dataclass
@@ -134,42 +132,35 @@ class LiveAnomalyService:
             categorical_context_columns=self.bundle["categorical_context_columns"],
             category_encoder=self.bundle["category_encoder"],
         )
-        self.detector = StreamingFiLMAnomalyDetector(
-            model=self.bundle["model"],
+        self.detector = StreamingHybridAnomalyDetector(
+            reconstruction_model=self.bundle["reconstruction_model"],
+            forecasting_model=self.bundle["forecasting_model"],
             x_scaler=self.bundle["x_scaler"],
             c_scaler=self.bundle["c_scaler"],
             detector_meta=self.bundle["detector_meta"],
             feature_names=self.bundle["feature_columns"],
             top_k_features=config.top_k_features,
             device=config.device,
+            model_mode=self.bundle["mode"],
         )
 
     def _load_bundle(self, model_dir: Path, device: str) -> dict[str, Any]:
-        checkpoint = torch.load(model_dir / "film_ae.pt", map_location=device)
-        model = build_model_from_checkpoint(checkpoint, device=device)
-
-        x_scaler = joblib.load(model_dir / "x_scaler.joblib")
-        c_scaler = joblib.load(model_dir / "c_scaler.joblib")
-        detector_meta = joblib.load(model_dir / "detector_meta.joblib")
+        bundle = load_model_artifacts(model_dir=model_dir, device=device)
         category_metadata = joblib.load(model_dir / "context_encoder.joblib")
-
-        feature_columns = list(checkpoint["feature_columns"])
-        context_columns = list(checkpoint["context_columns"])
-
+        feature_columns = list(bundle["feature_columns"])
+        context_columns = list(bundle["context_columns"])
         categorical_columns = list(category_metadata.get("columns", []))
         numeric_columns = [column for column in context_columns if column not in categorical_columns]
-
-        return {
-            "model": model,
-            "x_scaler": x_scaler,
-            "c_scaler": c_scaler,
-            "detector_meta": detector_meta,
-            "feature_columns": feature_columns,
-            "context_columns": context_columns,
-            "numeric_context_columns": numeric_columns,
-            "categorical_context_columns": categorical_columns,
-            "category_encoder": CategoryEncoder(category_metadata),
-        }
+        bundle.update(
+            {
+                "feature_columns": feature_columns,
+                "context_columns": context_columns,
+                "numeric_context_columns": numeric_columns,
+                "categorical_context_columns": categorical_columns,
+                "category_encoder": CategoryEncoder(category_metadata),
+            }
+        )
+        return bundle
 
     def ingest(self, payload: MetricPayload) -> dict[str, Any]:
         cleaned_features, context_vector = self.preprocessor.process(
@@ -196,6 +187,7 @@ class LiveAnomalyService:
             "entity_id": payload.entity_id,
             "machine_id": payload.machine_id,
             "time_stamp": payload.time_stamp,
+            "mode": str(result.mode),
             "window_ready": bool(result.ready),
             "threshold": float(self.detector.threshold),
             "window_size": int(self.detector.window_size),
@@ -210,6 +202,9 @@ class LiveAnomalyService:
                 "status": "anomaly" if int(result.predicted_label or 0) == 1 else "normal",
                 "predicted_label": int(result.predicted_label or 0),
                 "anomaly_score": float(result.anomaly_score or 0.0),
+                "recon_score": result.recon_score,
+                "forecast_score": result.forecast_score,
+                "final_score": result.final_score,
                 "top_k_features": result.top_k_features or [],
                 "top_k_feature_errors": result.top_k_feature_errors or [],
                 "feature_error_vector": result.feature_error_vector or [],

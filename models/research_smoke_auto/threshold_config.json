@@ -1,23 +1,6 @@
 {
   "default_mode": "hybrid",
-  "available_modes": [
-    "reconstruction",
-    "forecasting",
-    "hybrid"
-  ],
-  "threshold": 4.992697715759277,
-  "forecast_threshold": 5.878686428070068,
-  "hybrid_threshold": 5.061085224151611,
-  "threshold_quantile": 0.995,
-  "window_size": 30,
-  "forecast_horizon": 1,
-  "forecast_input_window_size": 29,
-  "n_features": 8,
-  "context_dim": 17,
-  "score_mode": "mean_feature_mse",
-  "num_train_windows": 69236,
-  "num_val_windows": 7693,
-  "num_test_windows": 19508,
+  "selected_threshold": 5.061085224151611,
   "alpha": 0.6,
   "beta": 0.4,
   "modes": {

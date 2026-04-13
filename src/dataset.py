@@ -812,6 +812,46 @@ def _write_split_memmaps(
     }
 
 
+def _write_forecasting_split_artifacts(
+    output_dir: Path,
+    split_name: str,
+    full_windows: np.ndarray,
+    forecast_horizon: int,
+) -> dict[str, Any]:
+    if forecast_horizon <= 0 or forecast_horizon >= int(full_windows.shape[1]):
+        raise ValueError(
+            "forecast_horizon must be >= 1 and smaller than the saved window_size "
+            f"(got forecast_horizon={forecast_horizon}, window_size={int(full_windows.shape[1])})."
+        )
+
+    x_forecast_path = output_dir / f"X_forecast_{split_name}.npy"
+    y_forecast_path = output_dir / f"y_forecast_{split_name}.npy"
+    input_shape = (
+        int(full_windows.shape[0]),
+        int(full_windows.shape[1]) - int(forecast_horizon),
+        int(full_windows.shape[2]),
+    )
+    target_shape = (
+        int(full_windows.shape[0]),
+        int(forecast_horizon),
+        int(full_windows.shape[2]),
+    )
+
+    x_forecast = _create_memmap(x_forecast_path, input_shape)
+    y_forecast = _create_memmap(y_forecast_path, target_shape)
+    x_forecast[:] = np.asarray(full_windows[:, :-forecast_horizon, :], dtype=np.float32)
+    y_forecast[:] = np.asarray(full_windows[:, -forecast_horizon:, :], dtype=np.float32)
+    x_forecast.flush()
+    y_forecast.flush()
+
+    return {
+        "x_forecast_path": x_forecast_path,
+        "y_forecast_path": y_forecast_path,
+        "x_forecast_shape": tuple(x_forecast.shape),
+        "y_forecast_shape": tuple(y_forecast.shape),
+    }
+
+
 def build_research_dataset(config: DatasetConfig | None = None) -> dict[str, Any]:
     config = config or DatasetConfig()
     ensure_directory(config.output_dir)
@@ -830,6 +870,18 @@ def build_research_dataset(config: DatasetConfig | None = None) -> dict[str, Any
         vocabulary=vocabulary,
         allowed_entities=allowed_entities,
     )
+    forecasting_train = _write_forecasting_split_artifacts(
+        output_dir=config.output_dir,
+        split_name="train",
+        full_windows=np.load(split_artifacts["x_train_path"], mmap_mode="r"),
+        forecast_horizon=config.forecast_horizon,
+    )
+    forecasting_test = _write_forecasting_split_artifacts(
+        output_dir=config.output_dir,
+        split_name="test",
+        full_windows=np.load(split_artifacts["x_test_path"], mmap_mode="r"),
+        forecast_horizon=config.forecast_horizon,
+    )
 
     feature_meta_path = config.output_dir / "feature_meta.joblib"
     dataset_meta_path = config.output_dir / "dataset_meta.json"
@@ -847,6 +899,8 @@ def build_research_dataset(config: DatasetConfig | None = None) -> dict[str, Any
         "preprocessing": "raw Alibaba archives -> chunked read -> streaming asof joins -> fill -> clip(min=0) -> log1p",
         "window_size": int(config.window_size),
         "stride": int(config.stride),
+        "forecast_horizon": int(config.forecast_horizon),
+        "forecast_input_window_size": int(config.window_size - config.forecast_horizon),
         "context_encoder": vocabulary.to_metadata(),
         "train_split": float(config.train_ratio),
     }
@@ -857,6 +911,8 @@ def build_research_dataset(config: DatasetConfig | None = None) -> dict[str, Any
         "train_windows": int(split_artifacts["x_train_shape"][0]),
         "test_windows": int(split_artifacts["x_test_shape"][0]),
         "window_size": int(config.window_size),
+        "forecast_horizon": int(config.forecast_horizon),
+        "forecast_input_window_size": int(config.window_size - config.forecast_horizon),
         "num_features": int(len(config.feature_columns)),
         "context_dim": int(len(config.context_columns)),
         "feature_columns": list(config.feature_columns),
@@ -864,6 +920,12 @@ def build_research_dataset(config: DatasetConfig | None = None) -> dict[str, Any
         "split_counts": {
             "train": int(split_artifacts["x_train_shape"][0]),
             "test": int(split_artifacts["x_test_shape"][0]),
+        },
+        "forecast_shapes": {
+            "X_forecast_train": forecasting_train["x_forecast_shape"],
+            "y_forecast_train": forecasting_train["y_forecast_shape"],
+            "X_forecast_test": forecasting_test["x_forecast_shape"],
+            "y_forecast_test": forecasting_test["y_forecast_shape"],
         },
     }
     joblib.dump(dataset_meta, config.output_dir / "dataset_meta.joblib")
@@ -877,6 +939,14 @@ def build_research_dataset(config: DatasetConfig | None = None) -> dict[str, Any
         "C_test": str(split_artifacts["c_test_path"].resolve()),
         "X_train_shape": split_artifacts["x_train_shape"],
         "X_test_shape": split_artifacts["x_test_shape"],
+        "X_forecast_train": str(forecasting_train["x_forecast_path"].resolve()),
+        "y_forecast_train": str(forecasting_train["y_forecast_path"].resolve()),
+        "X_forecast_test": str(forecasting_test["x_forecast_path"].resolve()),
+        "y_forecast_test": str(forecasting_test["y_forecast_path"].resolve()),
+        "X_forecast_train_shape": forecasting_train["x_forecast_shape"],
+        "y_forecast_train_shape": forecasting_train["y_forecast_shape"],
+        "X_forecast_test_shape": forecasting_test["x_forecast_shape"],
+        "y_forecast_test_shape": forecasting_test["y_forecast_shape"],
         "train_metadata": str(split_artifacts["train_metadata_path"].resolve()),
         "test_metadata": str(split_artifacts["test_metadata_path"].resolve()),
         "feature_meta": str(feature_meta_path.resolve()),
@@ -897,8 +967,12 @@ def load_dataset(dataset_dir: str | Path) -> dict[str, Any]:
     x_test_path = dataset_path / "X_test.npy"
     c_train_path = dataset_path / "C_train.npy"
     c_test_path = dataset_path / "C_test.npy"
+    x_forecast_train_path = dataset_path / "X_forecast_train.npy"
+    x_forecast_test_path = dataset_path / "X_forecast_test.npy"
+    y_forecast_train_path = dataset_path / "y_forecast_train.npy"
+    y_forecast_test_path = dataset_path / "y_forecast_test.npy"
     if x_train_path.exists() and x_test_path.exists():
-        return {
+        bundle = {
             "X_train": np.load(x_train_path, mmap_mode="r"),
             "X_test": np.load(x_test_path, mmap_mode="r"),
             "C_train": np.load(c_train_path, mmap_mode="r"),
@@ -906,6 +980,21 @@ def load_dataset(dataset_dir: str | Path) -> dict[str, Any]:
             "feature_meta": joblib.load(dataset_path / "feature_meta.joblib"),
             "dataset_meta": joblib.load(dataset_path / "dataset_meta.joblib"),
         }
+        if (
+            x_forecast_train_path.exists()
+            and x_forecast_test_path.exists()
+            and y_forecast_train_path.exists()
+            and y_forecast_test_path.exists()
+        ):
+            bundle.update(
+                {
+                    "X_forecast_train": np.load(x_forecast_train_path, mmap_mode="r"),
+                    "X_forecast_test": np.load(x_forecast_test_path, mmap_mode="r"),
+                    "y_forecast_train": np.load(y_forecast_train_path, mmap_mode="r"),
+                    "y_forecast_test": np.load(y_forecast_test_path, mmap_mode="r"),
+                }
+            )
+        return bundle
     return {
         "X": np.load(dataset_path / "X_all.npy", allow_pickle=False),
         "C": np.load(dataset_path / "C_all.npy", allow_pickle=False),

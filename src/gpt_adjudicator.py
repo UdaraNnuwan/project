@@ -28,7 +28,7 @@ VALID_LABELS = ["normal", "warning", "critical", "fault_candidate"]
 VALID_SEVERITIES = ["low", "medium", "high"]
 
 DEFAULT_GPT_INSTRUCTIONS = """
-You are assisting a FiLM autoencoder based anomaly detector for Alibaba container telemetry.
+You are assisting a multivariate anomaly detector for container telemetry.
 
 The autoencoder has already detected a threshold-crossing anomaly candidate. Your job is not to perform anomaly detection from scratch.
 
@@ -107,14 +107,21 @@ def build_window_summary(
         "window_id": int(record.get("window_id", -1)),
         "container_id": str(record.get("container_id", "unknown")),
         "machine_id": str(record.get("machine_id", "unknown")),
+        "mode": str(record.get("mode", "reconstruction")),
         "split": str(record.get("split", "")),
         "time_range": {
             "start_time": int(record.get("start_time", -1)),
             "end_time": int(record.get("end_time", -1)),
         },
+        "recon_score": record.get("recon_score"),
+        "forecast_score": record.get("forecast_score"),
+        "final_score": float(record.get("final_score", record.get("anomaly_score", 0.0))),
         "anomaly_score": float(record.get("anomaly_score", 0.0)),
         "threshold": float(record.get("threshold", 0.0)),
+        "dynamic_threshold": record.get("dynamic_threshold"),
+        "final_threshold": record.get("final_threshold"),
         "score_over_threshold": float(record.get("score_over_threshold", 0.0)),
+        "decision_reason": str(record.get("decision_reason", "")),
         "top_k_features": top_k_features,
         "top_k_feature_errors": [float(value) for value in top_k_feature_errors],
         "feature_error_vector": [float(value) for value in feature_error_vector],
@@ -129,13 +136,14 @@ def fallback_decision(summary: dict[str, Any]) -> dict[str, str]:
     ratio = float(summary["anomaly_score"]) / threshold
     top_features = summary.get("top_k_features", [])
     top_text = ", ".join(top_features[:3]) if top_features else "no dominant features"
+    mode = str(summary.get("mode", "reconstruction"))
 
     if ratio < 1.05:
         return {
             "label": "normal",
             "severity": "low",
             "explanation": (
-                f"The reconstruction score is only marginally above threshold. "
+                f"The {mode} score is only marginally above threshold. "
                 f"Top deviations: {top_text}. This looks more like a false positive than an active fault."
             ),
             "recommended_action": "ignore",
@@ -145,7 +153,7 @@ def fallback_decision(summary: dict[str, Any]) -> dict[str, str]:
             "label": "warning",
             "severity": "low",
             "explanation": (
-                f"A weak but credible anomaly is concentrated in {top_text}. "
+                f"A weak but credible {mode} anomaly is concentrated in {top_text}. "
                 f"Monitor the container and review recent events before escalation."
             ),
             "recommended_action": "monitor",
@@ -155,7 +163,7 @@ def fallback_decision(summary: dict[str, Any]) -> dict[str, str]:
             "label": "fault_candidate",
             "severity": "medium",
             "explanation": (
-                f"The anomaly is materially above threshold and concentrated in {top_text}. "
+                f"The {mode} anomaly is materially above threshold and concentrated in {top_text}. "
                 f"Treat this as a fault candidate pending operator review."
             ),
             "recommended_action": "inspect_container",
@@ -164,7 +172,7 @@ def fallback_decision(summary: dict[str, Any]) -> dict[str, str]:
         "label": "critical",
         "severity": "high",
         "explanation": (
-            f"The score is far above threshold and the highest reconstruction errors are in {top_text}. "
+            f"The {mode} score is far above threshold and the largest deviations are in {top_text}. "
             f"This is consistent with an active high-severity runtime issue."
         ),
         "recommended_action": "raise_alert",
@@ -308,6 +316,7 @@ def compare_ae_vs_gpt_decisions(adjudications: pd.DataFrame) -> pd.DataFrame:
                 "window_id",
                 "container_id",
                 "machine_id",
+                "mode",
                 "anomaly_score",
                 "ae_only_label",
                 "gpt_label",
@@ -322,6 +331,7 @@ def compare_ae_vs_gpt_decisions(adjudications: pd.DataFrame) -> pd.DataFrame:
             "window_id",
             "container_id",
             "machine_id",
+            "mode",
             "anomaly_score",
             "label",
             "severity",
@@ -336,6 +346,7 @@ def compare_ae_vs_gpt_decisions(adjudications: pd.DataFrame) -> pd.DataFrame:
             "window_id",
             "container_id",
             "machine_id",
+            "mode",
             "anomaly_score",
             "ae_only_label",
             "gpt_label",
