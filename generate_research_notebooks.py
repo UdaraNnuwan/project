@@ -68,60 +68,62 @@ MODEL_DIR = (PROJECT_ROOT / "models" / "research_smoke_auto").resolve()
 RESULTS_DIR = (PROJECT_ROOT / "results" / "research_smoke_auto").resolve()
 """
 
-
 nb01 = [
     code_cell(COMMON_IMPORTS),
     markdown_cell(
         """
         # 01 Build Dataset
 
-        This notebook prepares one shared multivariate dataset for:
-        - reconstruction windows
-        - forecasting inputs/targets
-        - hybrid experiments that combine both scores
+        This notebook prepares one shared multivariate dataset for reconstruction and forecasting. 
+        It loads raw node/container features and creates normalized rolling windows.
         """
     ),
     code_cell(
         """
         import pandas as pd
-
         from src.config import DatasetConfig
         from src.dataset import build_dataset, load_dataset
         from src.utils import read_json
         """
     ),
-    code_cell(
+    markdown_cell(
         """
-        cfg = DatasetConfig(
-            output_dir=DATASET_DIR,
-            window_size=30,
-            stride=5,
-            forecast_horizon=1,
-        )
-        cfg.to_dict()
+        ### Configure Dataset
+        We initialize the dataset config. Using defaults ensures it reads standard metrics from your `.env` seamlessly!
         """
     ),
     code_cell(
         """
+        # Removed hardcoded parameters to get static metrics values directly from .env config!
+        cfg = DatasetConfig(output_dir=DATASET_DIR)
+        cfg_dict = cfg.to_dict()
+        for k, v in cfg_dict.items():
+            if not str(k).endswith('_columns'):
+                print(f"{k}: {v}")
+        """
+    ),
+    markdown_cell("### Build and Load Dataset"),
+    code_cell(
+        """
         build_summary = build_dataset(cfg)
-        build_summary
+        print("Build Summary:", build_summary)
         """
     ),
     code_cell(
         """
         dataset_bundle = load_dataset(DATASET_DIR)
-        {
-            "X_train": dataset_bundle["X_train"].shape,
-            "X_test": dataset_bundle["X_test"].shape,
-            "X_forecast_train": dataset_bundle.get("X_forecast_train").shape if dataset_bundle.get("X_forecast_train") is not None else None,
-            "y_forecast_train": dataset_bundle.get("y_forecast_train").shape if dataset_bundle.get("y_forecast_train") is not None else None,
-            "feature_meta": dataset_bundle["feature_meta"],
-        }
+        print("Dataset Shapes:")
+        print("X_train (Features):", dataset_bundle["X_train"].shape)
+        print("X_test (Features):", dataset_bundle["X_test"].shape)
+        if dataset_bundle.get("X_forecast_train") is not None:
+             print("X_forecast_train:", dataset_bundle["X_forecast_train"].shape)
         """
     ),
+    markdown_cell("### Inspection Summary"),
     code_cell(
         """
-        read_json(DATASET_DIR / "dataset_build_summary.json")
+        summary_df = pd.Series(read_json(DATASET_DIR / "dataset_build_summary.json")).to_frame("Value")
+        display(summary_df)
         """
     ),
 ]
@@ -133,75 +135,82 @@ nb02 = [
         """
         # 02 Train
 
-        Train the selectable anomaly models:
-        - `reconstruction`
-        - `forecasting`
-        - `hybrid` (trains both and saves hybrid threshold metadata)
+        Trains the core anomaly detection models:
+        - `reconstruction`: A FiLM autoencoder mapping context variables to detect unexpected signals.
+        - `forecasting`: Predicting next frames.
+        - `hybrid`: Combines both approaches via a weighted score.
         """
     ),
     code_cell(
         """
         import pandas as pd
-
         from src.config import TrainConfig
         from src.train import train_model
         from src.utils import read_json
         """
     ),
+    markdown_cell("### Train Reconstruction Model (FiLM Autoencoder)"),
     code_cell(
         """
         recon_cfg = TrainConfig(
             dataset_dir=DATASET_DIR,
             model_dir=MODEL_DIR,
             model_mode="reconstruction",
-            epochs=10,
-            batch_size=128,
-            device="cpu",
+            device="cuda" # Changed from cpu to setup for GPU accel if accessible
         )
         recon_summary = train_model(recon_cfg)
-        recon_summary["detector_meta"]["modes"]["reconstruction"]
+        print("Model saved to:", recon_summary['model_dir'])
+        print("Artifact maps:", recon_summary['artifact_paths'])
+        display(recon_summary["detector_meta"]["modes"]["reconstruction"])
         """
     ),
+    markdown_cell("### Train Forecasting Model"),
     code_cell(
         """
         forecast_cfg = TrainConfig(
             dataset_dir=DATASET_DIR,
             model_dir=MODEL_DIR,
             model_mode="forecasting",
-            epochs=10,
-            batch_size=128,
-            forecast_horizon=1,
-            device="cpu",
+            device="cuda"
         )
         forecast_summary = train_model(forecast_cfg)
-        forecast_summary["detector_meta"]["modes"]["forecasting"]
+        print("Model saved to:", forecast_summary['model_dir'])
         """
     ),
+    markdown_cell("### Train Hybrid Threshold"),
     code_cell(
         """
         hybrid_cfg = TrainConfig(
             dataset_dir=DATASET_DIR,
             model_dir=MODEL_DIR,
             model_mode="hybrid",
-            epochs=10,
-            batch_size=128,
-            alpha=0.6,
-            beta=0.4,
-            forecast_horizon=1,
-            device="cpu",
+            device="cuda"
         )
         hybrid_summary = train_model(hybrid_cfg)
-        hybrid_summary["detector_meta"]
+        display(hybrid_summary["detector_meta"])
+        """
+    ),
+    markdown_cell("### Training History Visualization"),
+    code_cell(
+        """
+        import matplotlib.pyplot as plt
+        history = pd.read_csv(MODEL_DIR / "training_history_all.csv")
+        display(history.tail())
+        
+        plt.figure(figsize=(10,4))
+        for mode in history['model_name'].unique():
+            subset = history[history['model_name'] == mode]
+            plt.plot(subset['epoch'], subset['val_loss'], label=mode + " val_loss")
+            plt.plot(subset['epoch'], subset['train_loss'], label=mode + " train_loss", linestyle='--')
+        plt.title('Training Loss Over Time')
+        plt.legend()
+        plt.show()
         """
     ),
     code_cell(
         """
-        pd.read_csv(MODEL_DIR / "training_history_all.csv").tail()
-        """
-    ),
-    code_cell(
-        """
-        read_json(MODEL_DIR / "threshold_config.json")
+        print("Threshold Configuration:")
+        display(read_json(MODEL_DIR / "threshold_config.json"))
         """
     ),
 ]
@@ -213,24 +222,21 @@ nb03 = [
         """
         # 03 Evaluate
 
-        Evaluate reconstruction, forecasting, and hybrid modes together and compare:
-        - precision
-        - recall
-        - F1
-        - ROC-AUC
-        - PR-AUC
-        - false positive rate
+        Evaluates the trained models, runs the mathematical dynamic threshold validation, and creates visual inspection plots for anomalies.
         """
     ),
     code_cell(
         """
+        import numpy as np
         import pandas as pd
-
+        import matplotlib.pyplot as plt
+        import seaborn as sns
         from src.config import EvalConfig
         from src.evaluate import evaluate_model
         from src.utils import read_json
         """
     ),
+    markdown_cell("### Run Base Evaluation"),
     code_cell(
         """
         eval_cfg = EvalConfig(
@@ -242,44 +248,110 @@ nb03 = [
             split="test",
             use_synthetic_injection=True,
             include_gpt_in_stream=False,
-            device="cpu",
+            device="cuda",
         )
         eval_summary = evaluate_model(eval_cfg)
-        eval_summary["evaluation_summary"]
+        display(eval_summary["evaluation_summary"])
         """
     ),
-    code_cell(
-        """
-        comparison = pd.read_csv(RESULTS_DIR / "mode_comparison.csv")
-        comparison
-        """
-    ),
+    markdown_cell("### Dynamic Threshold Analysis\nUsing `.env` populated configurations, compute standard metrics."),
     code_cell(
         """
         hybrid_stream = pd.read_csv(RESULTS_DIR / "hybrid" / "realtime_stream_predictions.csv")
-        hybrid_stream[
-            [
-                "window_id",
-                "mode",
-                "recon_score",
-                "forecast_score",
-                "final_score",
-                "final_threshold",
-                "decision",
-            ]
-        ].head()
+        
+        # Make sure dynamic threshold uses the exact anomaly_score variable (final_score)
+        anomaly_score = hybrid_stream['final_score'].values
+        
+        dyn_percentile = eval_cfg.dynamic_threshold_percentile
+        z_threshold = eval_cfg.z_score_threshold
+        history_limit = eval_cfg.dynamic_threshold_history_limit
+        
+        dynamic_thresholds = np.zeros_like(anomaly_score)
+        z_scores = np.zeros_like(anomaly_score)
+        candidate_flags = np.zeros_like(anomaly_score, dtype=bool)
+
+        for i in range(len(anomaly_score)):
+            start_idx = max(0, i - history_limit)
+            history = anomaly_score[start_idx:i]
+            
+            if len(history) > 5:
+                dyn_thresh = np.percentile(history, dyn_percentile)
+                mean_hist = np.mean(history)
+                std_hist = np.std(history) + 1e-8
+                z = (anomaly_score[i] - mean_hist) / std_hist
+            else:
+                dyn_thresh = anomaly_score[i]
+                z = 0.0
+                
+            dynamic_thresholds[i] = dyn_thresh
+            z_scores[i] = z
+            candidate_flags[i] = (anomaly_score[i] > dyn_thresh) or (z > z_threshold)
+
+        hybrid_stream['calculated_dynamic_threshold'] = dynamic_thresholds
+        hybrid_stream['calculated_z_score'] = z_scores
+        hybrid_stream['is_candidate'] = candidate_flags
+        
+        # Save evaluation outputs
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        (RESULTS_DIR / "hybrid").mkdir(parents=True, exist_ok=True)
+        hybrid_stream.to_csv(RESULTS_DIR / "hybrid" / "realtime_stream_predictions_enhanced.csv", index=False)
+        display(hybrid_stream[['window_id', 'final_score', 'calculated_dynamic_threshold', 'calculated_z_score', 'is_candidate']].head())
         """
     ),
+    markdown_cell("### Visualization: Score Distributions"),
     code_cell(
         """
-        read_json(RESULTS_DIR / "hybrid" / "evaluation_summary.json")
+        plt.figure(figsize=(12, 5))
+        sns.histplot(hybrid_stream['final_score'], bins=50, kde=True, color='blue', alpha=0.6)
+        plt.axvline(hybrid_stream['final_threshold'].mean(), color='red', linestyle='dashed', linewidth=2, label='Mean Final Threshold')
+        plt.title('Anomaly Score Distribution')
+        plt.legend()
+        plt.savefig(RESULTS_DIR / 'hybrid' / 'anomaly_score_distribution.png')
+        plt.show()
         """
     ),
+    markdown_cell("### Visualization: Top Anomalous Windows"),
     code_cell(
         """
-        read_json(RESULTS_DIR / "hybrid" / "event_metrics.json")
+        top_anomalies = hybrid_stream.sort_values(by='final_score', ascending=False).head(10)
+        
+        plt.figure(figsize=(10, 5))
+        sns.barplot(x=top_anomalies['window_id'].astype(str), y=top_anomalies['final_score'], palette='Reds_r')
+        plt.title('Top 10 Anomalous Windows by Final Score')
+        plt.xticks(rotation=45)
+        plt.savefig(RESULTS_DIR / 'hybrid' / 'top_anomalous_windows.png')
+        plt.show()
         """
     ),
+    markdown_cell("### Visualization: Paper-Style Time Series & Thresholds"),
+    code_cell(
+        """
+        fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
+        
+        # Subplot 1: Components
+        axes[0].plot(hybrid_stream['window_id'], hybrid_stream['recon_score'], label='Reconstruction Score', alpha=0.7)
+        axes[0].plot(hybrid_stream['window_id'], hybrid_stream['forecast_score'], label='Forecast Score', alpha=0.7)
+        axes[0].set_title('Component Anomaly Scores Over Time')
+        axes[0].legend()
+        axes[0].grid(True)
+        
+        # Subplot 2: Dynamic vs Final
+        axes[1].plot(hybrid_stream['window_id'], hybrid_stream['final_score'], label='Final Anomaly Score', color='purple')
+        axes[1].plot(hybrid_stream['window_id'], hybrid_stream['calculated_dynamic_threshold'], label='Dynamic Threshold', color='orange', linestyle='--')
+        axes[1].plot(hybrid_stream['window_id'], hybrid_stream['final_threshold'], label='Static Threshold', color='red', linestyle=':')
+        
+        # Highlight candidates
+        candidate_indices = hybrid_stream[hybrid_stream['is_candidate']]['window_id']
+        axes[1].scatter(candidate_indices, hybrid_stream[hybrid_stream['is_candidate']]['final_score'], color='red', marker='x', label='Candidate Flags')
+        
+        axes[1].set_title('Final Score vs Dynamic/Static Thresholds')
+        axes[1].legend()
+        axes[1].grid(True)
+        plt.tight_layout()
+        plt.savefig(RESULTS_DIR / 'hybrid' / 'paper_style_timeseries.png')
+        plt.show()
+        """
+    )
 ]
 
 
@@ -287,65 +359,72 @@ nb04 = [
     code_cell(COMMON_IMPORTS),
     markdown_cell(
         """
-        # 04 GPT
+        # 04 GPT Adjudication
 
-        GPT adjudication only runs on confirmed anomalies from the selected live/evaluation mode.
-        The compact payload includes the mode, component scores, threshold context, and dominant features.
+        This workflow delegates the **final semantic decision layer** to GPT.
+        
+        * GPT *only* processes anomaly candidates (not all windows) to reduce cost and noise.
+        * If the GPT label == `normal`, it marks the incident as `skipped_for_alerting`.
         """
     ),
     code_cell(
         """
         import pandas as pd
-
         from src.config import GPTConfig
         from src.gpt_adjudicator import adjudicate_anomaly_records, build_window_summary, call_openai_responses_api
         from src.utils import read_json
         """
     ),
+    markdown_cell("### Extract Candidates"),
     code_cell(
         """
         cfg = GPTConfig(
             evaluation_dir=RESULTS_DIR,
             output_dir=RESULTS_DIR,
-            max_records=20,
+            max_records=20, # Evaluates max top 20 verified candidates
         )
 
-        confirmed_alerts = pd.read_csv(RESULTS_DIR / "realtime_alert_candidates.csv")
-        confirmed_alerts.head()
+        try:
+            confirmed_alerts = pd.read_csv(RESULTS_DIR / "realtime_alert_candidates.csv")
+        except FileNotFoundError:
+            # Fallback if realtime alerts missing, get from streaming enriched.
+            stream = pd.read_csv(RESULTS_DIR / "hybrid" / "realtime_stream_predictions_enhanced.csv")
+            confirmed_alerts = stream[stream['is_candidate'] == True].copy()
+            
+        print(f"Loaded {len(confirmed_alerts)} anomaly candidates for GPT processing.")
         """
     ),
-    code_cell(
-        """
-        sample_payload = confirmed_alerts.iloc[0].to_dict() if len(confirmed_alerts) > 0 else {}
-        sample_summary = build_window_summary(sample_payload) if sample_payload else {}
-        sample_summary
-        """
-    ),
-    code_cell(
-        """
-        if sample_summary:
-            sample_decision, sample_meta = call_openai_responses_api(sample_summary, cfg)
-        else:
-            sample_decision, sample_meta = {}, {}
-
-        sample_meta, sample_decision
-        """
-    ),
+    markdown_cell("### Adjudication Flow"),
     code_cell(
         """
         adjudication_summary = adjudicate_anomaly_records(
-            prediction_csv_path=RESULTS_DIR / "window_level_predictions.csv",
+            prediction_csv_path=RESULTS_DIR / "hybrid" / "realtime_stream_predictions.csv", # Update logic path
             config=cfg,
             max_records=cfg.max_records,
         )
-        adjudication_summary
         """
     ),
+    markdown_cell("### Results Preview Table\nSkip standard routing if GPT believes the state is 'normal'."),
     code_cell(
         """
-        read_json(RESULTS_DIR / "ae_vs_gpt_comparison.json")
+        try:
+            gpt_results = pd.read_csv(RESULTS_DIR / "gpt_adjudicated_alerts.csv")
+            # Apply logic: if GPT label == normal, mark as skipped
+            is_normal = gpt_results['gpt_label'].str.lower().str.contains('normal', na=False)
+            gpt_results['skipped_for_alerting'] = is_normal
+            
+            # Save the updated frame
+            gpt_results.to_csv(RESULTS_DIR / "gpt_adjudicated_alerts.csv", index=False)
+            
+            display_cols = ['window_id', 'gpt_label', 'skipped_for_alerting', 'gpt_reason']
+            display_cols = [c for c in display_cols if c in gpt_results.columns]
+            
+            print("GPT Decisions Preview:")
+            display(gpt_results[display_cols].head(10))
+        except FileNotFoundError:
+            print("No GPT records generated. Check API Key or candidate limits.")
         """
-    ),
+    )
 ]
 
 

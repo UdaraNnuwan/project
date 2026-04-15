@@ -30,21 +30,23 @@ VALID_SEVERITIES = ["low", "medium", "high"]
 DEFAULT_GPT_INSTRUCTIONS = """
 You are assisting a multivariate anomaly detector for container telemetry.
 
-The autoencoder has already detected a threshold-crossing anomaly candidate. Your job is not to perform anomaly detection from scratch.
+The underlying autoencoder has already detected a threshold-crossing anomaly candidate. Your job is to act as the final semantic decision layer and filter noise.
 
-Use the provided compact summary only to:
-1. interpret the anomaly
-2. filter likely false positives
-3. classify severity
-4. recommend an action
+Analyze the compact window summary to:
+1. Provide a Root Cause Analysis matching the top deviating features.
+2. Produce an Impact Analysis assessing the threat to the container or cluster.
+3. Classify the severity explicitly (low/medium/high).
+4. Provide Step-by-Step Recommendations for SREs.
+5. Determine if it is a false positive ("normal" label).
 
-Return JSON only with the required schema. Be conservative with escalation:
-- choose "normal" when the threshold crossing looks like a likely false positive
-- choose "warning" for mild but credible issues
-- choose "fault_candidate" for meaningful anomalies that need investigation
-- choose "critical" for strong evidence of an active severe fault
+Return JSON only matching the schema exactly.
+Be extremely conservative with escalation:
+- choose "normal" when the threshold crossing looks like a likely false positive or benign spike.
+- choose "warning" for mild but credible issues.
+- choose "fault_candidate" for meaningful anomalies that need deep investigation.
+- choose "critical" for strong evidence of an active severe fault (e.g., node death, OOM, extreme network saturation).
 
-Keep the explanation concise and operationally useful.
+Keep the explanations and step-by-step instructions concise, avoiding bloated rhetoric.
 """.strip()
 
 RESPONSE_JSON_SCHEMA = {
@@ -59,13 +61,27 @@ RESPONSE_JSON_SCHEMA = {
             "type": "string",
             "enum": VALID_SEVERITIES,
         },
+        "root_cause": {"type": "string"},
+        "impact_analysis": {"type": "string"},
+        "step_by_step_recommendations": {
+            "type": "array",
+            "items": {"type": "string"}
+        },
         "explanation": {"type": "string"},
         "recommended_action": {
             "type": "string",
             "enum": RECOMMENDED_ACTIONS,
         },
     },
-    "required": ["label", "severity", "explanation", "recommended_action"],
+    "required": [
+        "label",
+        "severity",
+        "root_cause",
+        "impact_analysis",
+        "step_by_step_recommendations",
+        "explanation",
+        "recommended_action"
+    ],
 }
 
 
@@ -131,7 +147,7 @@ def build_window_summary(
     }
 
 
-def fallback_decision(summary: dict[str, Any]) -> dict[str, str]:
+def fallback_decision(summary: dict[str, Any]) -> dict[str, Any]:
     threshold = max(1e-6, float(summary["threshold"]))
     ratio = float(summary["anomaly_score"]) / threshold
     top_features = summary.get("top_k_features", [])
@@ -142,6 +158,9 @@ def fallback_decision(summary: dict[str, Any]) -> dict[str, str]:
         return {
             "label": "normal",
             "severity": "low",
+            "root_cause": f"Minor threshold breach in {top_text}.",
+            "impact_analysis": "No significant impact. Likely normal workload variance.",
+            "step_by_step_recommendations": ["Ignore candidate."],
             "explanation": (
                 f"The {mode} score is only marginally above threshold. "
                 f"Top deviations: {top_text}. This looks more like a false positive than an active fault."
@@ -152,6 +171,9 @@ def fallback_decision(summary: dict[str, Any]) -> dict[str, str]:
         return {
             "label": "warning",
             "severity": "low",
+            "root_cause": f"Sustained deviation in {top_text}.",
+            "impact_analysis": "Potential early stage degradation.",
+            "step_by_step_recommendations": ["Monitor telemetry.", "Check logs."],
             "explanation": (
                 f"A weak but credible {mode} anomaly is concentrated in {top_text}. "
                 f"Monitor the container and review recent events before escalation."
@@ -162,6 +184,9 @@ def fallback_decision(summary: dict[str, Any]) -> dict[str, str]:
         return {
             "label": "fault_candidate",
             "severity": "medium",
+            "root_cause": f"Significant spike in {top_text}.",
+            "impact_analysis": "Service performance is likely affected locally.",
+            "step_by_step_recommendations": ["Inspect workload.", "Review pod states.", "Correlate with deployments."],
             "explanation": (
                 f"The {mode} anomaly is materially above threshold and concentrated in {top_text}. "
                 f"Treat this as a fault candidate pending operator review."
@@ -171,6 +196,9 @@ def fallback_decision(summary: dict[str, Any]) -> dict[str, str]:
     return {
         "label": "critical",
         "severity": "high",
+        "root_cause": f"Severe fault isolated to {top_text}.",
+        "impact_analysis": "High probability of cascading failure or node outage.",
+        "step_by_step_recommendations": ["Isolate node.", "Alert on-call.", "Drain traffic."],
         "explanation": (
             f"The {mode} score is far above threshold and the largest deviations are in {top_text}. "
             f"This is consistent with an active high-severity runtime issue."
@@ -179,10 +207,17 @@ def fallback_decision(summary: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def normalize_decision(decision: dict[str, Any], summary: dict[str, Any]) -> dict[str, str]:
+def normalize_decision(decision: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
+    steps = decision.get("step_by_step_recommendations", [])
+    if not isinstance(steps, list):
+        steps = [str(steps)]
+        
     normalized = {
         "label": str(decision.get("label", "")).strip().lower(),
         "severity": str(decision.get("severity", "")).strip().lower(),
+        "root_cause": str(decision.get("root_cause", "")).strip(),
+        "impact_analysis": str(decision.get("impact_analysis", "")).strip(),
+        "step_by_step_recommendations": [str(s) for s in steps] if steps else [],
         "explanation": str(decision.get("explanation", "")).strip(),
         "recommended_action": str(decision.get("recommended_action", "")).strip(),
     }
@@ -196,13 +231,20 @@ def normalize_decision(decision: dict[str, Any], summary: dict[str, Any]) -> dic
         normalized["recommended_action"] = fallback["recommended_action"]
     if not normalized["explanation"]:
         normalized["explanation"] = fallback["explanation"]
+    if not normalized["root_cause"]:
+        normalized["root_cause"] = fallback["root_cause"]
+    if not normalized["impact_analysis"]:
+        normalized["impact_analysis"] = fallback["impact_analysis"]
+    if not normalized["step_by_step_recommendations"]:
+        normalized["step_by_step_recommendations"] = fallback["step_by_step_recommendations"]
+        
     return normalized
 
 
 def call_openai_responses_api(
     summary: dict[str, Any],
     config: GPTConfig,
-) -> tuple[dict[str, str], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     prompt = load_prompt_template(config.prompt_template_path)
     api_key = config.api_key
     if not api_key:
@@ -285,6 +327,9 @@ def adjudicate_anomaly(
         "structured_json": decision,
         "label": decision["label"],
         "severity": decision["severity"],
+        "root_cause": decision["root_cause"],
+        "impact_analysis": decision["impact_analysis"],
+        "step_by_step_recommendations": decision.get("step_by_step_recommendations", []),
         "explanation": decision["explanation"],
         "recommended_action": decision["recommended_action"],
         "used_fallback": bool(call_meta.get("used_fallback", False)),
@@ -321,6 +366,8 @@ def compare_ae_vs_gpt_decisions(adjudications: pd.DataFrame) -> pd.DataFrame:
                 "ae_only_label",
                 "gpt_label",
                 "severity",
+                "root_cause",
+                "impact_analysis",
                 "recommended_action",
                 "explanation",
             ]
@@ -335,12 +382,14 @@ def compare_ae_vs_gpt_decisions(adjudications: pd.DataFrame) -> pd.DataFrame:
             "anomaly_score",
             "label",
             "severity",
+            "root_cause",
+            "impact_analysis",
             "recommended_action",
             "explanation",
         ]
     ].copy()
     comparison = comparison.rename(columns={"label": "gpt_label"})
-    comparison["ae_only_label"] = "fault_candidate"
+    comparison["ae_only_label"] = "fault_candidate" # Emulates what Autoencoder originally outputted.
     comparison = comparison[
         [
             "window_id",
@@ -351,6 +400,8 @@ def compare_ae_vs_gpt_decisions(adjudications: pd.DataFrame) -> pd.DataFrame:
             "ae_only_label",
             "gpt_label",
             "severity",
+            "root_cause",
+            "impact_analysis",
             "recommended_action",
             "explanation",
         ]
@@ -367,7 +418,14 @@ def adjudicate_anomaly_records(
     ensure_directory(config.output_dir)
 
     predictions = pd.read_csv(prediction_csv_path)
-    anomalous = predictions[predictions["predicted_label"] == 1].copy()
+    
+    # Check if 'is_candidate' logic exists from eval loop to reduce API calls latency:
+    if 'is_candidate' in predictions.columns:
+        anomalous = predictions[predictions["is_candidate"] == True].copy()
+    else:
+        # Fallback to strictly looking at predicted_label if advanced candidates aren't flagged
+        anomalous = predictions[predictions["predicted_label"] == 1].copy()
+        
     anomalous = anomalous.sort_values("anomaly_score", ascending=False)
     keep_count = max_records or config.max_records
     anomalous = anomalous.head(keep_count).reset_index(drop=True)

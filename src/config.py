@@ -15,7 +15,7 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 CHUNK_SIZE = 10_000
 WINDOW_SIZE = 30
 STRIDE = 5
-TRAIN_SPLIT = 0.80
+TRAIN_SPLIT = 0.70
 MIN_USAGE_ROWS = 500_000
 
 DEFAULT_RAW_ROOT_CANDIDATES = (
@@ -108,7 +108,7 @@ class DatasetConfig:
         default_factory=lambda: max(1, env_int("FORECAST_HORIZON", 1))
     )
     train_ratio: float = TRAIN_SPLIT
-    val_ratio: float = 0.0
+    val_ratio: float = 0.10
     min_window_observed_ratio: float = 0.60
     feature_columns: tuple[str, ...] = (
         "cpu_util",

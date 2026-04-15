@@ -31,17 +31,22 @@ class FiLMBlock(nn.Module):
         out_channels: int,
         context_dim: int,
         kernel_size: int = 3,
+        dropout: float = 0.1,
     ) -> None:
         super().__init__()
         padding = kernel_size // 2
         self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding)
+        self.norm = nn.GroupNorm(1, out_channels)
         self.film = FiLM(out_channels, context_dim)
         self.activation = nn.ReLU()
+        self.dropout = nn.Dropout1d(dropout)
 
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         hidden = self.conv(x)
+        hidden = self.norm(hidden)
         hidden = self.film(hidden, context)
-        return self.activation(hidden)
+        hidden = self.activation(hidden)
+        return self.dropout(hidden)
 
 
 class FiLMAutoencoder(nn.Module):
@@ -60,6 +65,7 @@ class FiLMAutoencoder(nn.Module):
         context_dim: int,
         units: int = 64,
         latent: int = 64,
+        dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.window_size = int(window_size)
@@ -68,13 +74,20 @@ class FiLMAutoencoder(nn.Module):
         self.units = int(units)
         self.latent = int(latent)
 
-        self.encoder_block_1 = FiLMBlock(n_features, units, context_dim)
-        self.encoder_block_2 = FiLMBlock(units, units, context_dim)
+        # Encoder
+        self.encoder_block_1 = FiLMBlock(n_features, units, context_dim, dropout=dropout)
+        self.encoder_block_2 = FiLMBlock(units, units, context_dim, dropout=dropout)
+        self.encoder_block_3 = FiLMBlock(units, units, context_dim, dropout=dropout)
         self.global_pool = nn.AdaptiveAvgPool1d(1)
+        
+        self.latent_dropout = nn.Dropout(dropout)
         self.latent_projection = nn.Linear(units, latent)
 
+        # Decoder
         self.decoder_dense = nn.Linear(latent, window_size * units)
-        self.decoder_block = FiLMBlock(units, units, context_dim)
+        self.decoder_block_1 = FiLMBlock(units, units, context_dim, dropout=dropout)
+        self.decoder_block_2 = FiLMBlock(units, units, context_dim, dropout=dropout)
+        
         self.decoder_conv = nn.Conv1d(units, units, kernel_size=3, padding=1)
         self.decoder_activation = nn.ReLU()
         self.output_projection = nn.Conv1d(units, n_features, kernel_size=3, padding=1)
@@ -83,12 +96,18 @@ class FiLMAutoencoder(nn.Module):
         hidden = x.transpose(1, 2)
         hidden = self.encoder_block_1(hidden, context)
         hidden = self.encoder_block_2(hidden, context)
+        hidden = self.encoder_block_3(hidden, context)
+        
         hidden = self.global_pool(hidden).squeeze(-1)
+        hidden = self.latent_dropout(hidden)
         latent = functional.relu(self.latent_projection(hidden))
 
         decoded = functional.relu(self.decoder_dense(latent))
         decoded = decoded.view(-1, self.units, self.window_size)
-        decoded = self.decoder_block(decoded, context)
+        
+        decoded = self.decoder_block_1(decoded, context)
+        decoded = self.decoder_block_2(decoded, context)
+        
         decoded = self.decoder_activation(self.decoder_conv(decoded))
         output = self.output_projection(decoded)
         return output.transpose(1, 2)
@@ -104,9 +123,10 @@ def build_reconstruction_model_from_checkpoint(
         context_dim=int(checkpoint["context_dim"]),
         units=int(checkpoint.get("units", 64)),
         latent=int(checkpoint.get("latent", 64)),
+        dropout=float(checkpoint.get("dropout", 0.1)),
     )
     state_dict = checkpoint.get("model_state_dict", checkpoint)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
     if device is not None:
         model.to(device)
     model.eval()

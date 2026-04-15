@@ -429,14 +429,14 @@ def build_model(ae_meta, x_dim, c_dim):
         n_features = int(checkpoint.get("n_features", x_dim))
         context_dim = int(checkpoint.get("context_dim", c_dim))
         units = int(checkpoint.get("units", 64))
-        latent = int(checkpoint.get("latent", 16))
+        latent = int(checkpoint.get("latent", 64))
     else:
         state_dict = checkpoint
         window_size = extract_window_size(ae_meta, {})
         n_features = x_dim
         context_dim = c_dim
         units = 64
-        latent = 16
+        latent = 64
 
     LOGGER.info(
         f"Checkpoint params | window_size={window_size}, "

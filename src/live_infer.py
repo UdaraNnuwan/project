@@ -216,8 +216,8 @@ class StreamingHybridAnomalyDetector:
                 metadata=metadata,
             )
 
-        raw_window = np.stack(list(buffer), axis=0)
-        window = np.log1p(np.clip(raw_window, a_min=0.0, a_max=None)).astype(np.float32)
+        raw_window = np.asarray(buffer, dtype=np.float32)
+        window = np.log1p(np.clip(raw_window, a_min=0.0, a_max=None))
         window_scaled = apply_3d_scaler(self.x_scaler, window[None, ...])
         context_scaled = self.c_scaler.transform(
             np.asarray(context_vector, dtype=np.float32).reshape(1, -1)
