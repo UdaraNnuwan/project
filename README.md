@@ -1,140 +1,90 @@
-# Container Anomaly Detection Pipeline
+# BiLSTM-FiLM Container Anomaly Detection
+### Dual-Head Hybrid Reconstruction + Forecasting Architecture
 
-This branch adds a selectable multivariate anomaly stack with three modes:
+A production-grade, context-aware anomaly detection system for containerised
+environments, built on the Alibaba Cloud Trace 2018 dataset.
 
-- `reconstruction`: FiLM autoencoder reconstruction error
-- `forecasting`: GRU forecasting error on the next timestep / short horizon
-- `hybrid`: `ALPHA * recon_score + BETA * forecast_score`
+---
 
-GPT adjudication and Telegram alerts remain downstream of confirmed anomalies only.
+## Architecture
 
-## Main Config
+```
+Input (B, W, F) + Metadata (B, M)
+        │
+┌───────▼──────────────────────────────┐
+│         SHARED ENCODER               │
+│  BiLSTM(128) → BN → BiLSTM(64)      │
+│  → Linear(64) → FiLM(meta) → z      │
+└───────┬──────────────┬───────────────┘
+        │              │
+┌───────▼──────┐ ┌─────▼────────────────┐
+│  HEAD 1      │ │  HEAD 2              │
+│ Reconstruction│ │  Forecasting (t+1)   │
+│  (B, W, F)   │ │  (B, F)             │
+└──────────────┘ └──────────────────────┘
 
-Use `MODEL_MODE` to select the scoring path:
-
-```powershell
-$env:MODEL_MODE="reconstruction"
-$env:MODEL_MODE="forecasting"
-$env:MODEL_MODE="hybrid"
+Loss = α·MSE_recon + (1-α)·MSE_forecast   (α = 0.5)
 ```
 
-Hybrid weights are configurable:
+## Project Structure
 
-```powershell
-$env:ALPHA="0.6"
-$env:BETA="0.4"
+```
+project/
+├── alibaba_trace/
+│   ├── model_architecture.py      # BiLSTM-FiLM dual-head model (PyTorch)
+│   ├── data_pipeline.py           # Streaming dataset from .tar.gz archive
+│   ├── incident_response.py       # Alerting engine (Prometheus + Telegram + GenAI RCA)
+│   ├── 01_Model_Training.ipynb    # Train the dual-head model
+│   ├── 02_Evaluation_and_Thesis_Graphs.ipynb  # 300 DPI thesis figures
+│   ├── 03_Alerting_and_RCA_Prototype.ipynb    # Prometheus + Telegram alerts
+│   ├── 04_Data_Injection_and_Accuracy_Testing.ipynb  # FiLM context validation
+│   ├── 05_GenAI_RCA_Integration.ipynb         # Gemini/GPT-4 root cause analysis
+│   ├── requirements.txt
+│   └── outputs/                   # Saved model checkpoints + figures (git-ignored)
+├── .env                           # API keys (git-ignored)
+└── .gitignore
 ```
 
-Forecasting horizon is configurable:
+## Quick Start
 
-```powershell
-$env:FORECAST_HORIZON="1"
+### 1. Install dependencies
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install -r alibaba_trace/requirements.txt
 ```
 
-## Notebooks
-
-Run in this order:
-
-1. `notebooks/01_build_dataset.ipynb`
-2. `notebooks/02_train.ipynb`
-3. `notebooks/03_eval.ipynb`
-4. `notebooks/04_gpt.ipynb`
-
-`notebooks/01_build_dataset.ipynb` now writes both reconstruction windows and forecasting inputs/targets.
-
-`notebooks/02_train.ipynb` trains reconstruction, forecasting, and hybrid-ready artifacts.
-
-`notebooks/03_eval.ipynb` compares all three modes and writes:
-
-- precision
-- recall
-- F1
-- ROC-AUC
-- PR-AUC
-- false positive rate
-- score-vs-threshold plots
-- reconstruction-vs-forecast score plots
-- confusion matrix / ROC / PR curves
-
-`notebooks/04_gpt.ipynb` operates on confirmed anomalies only.
-
-## Code Layout
-
-- `src/model_reconstruction.py`: FiLM autoencoder
-- `src/model_forecasting.py`: GRU forecaster
-- `src/hybrid_scoring.py`: reconstruction / forecasting / hybrid score computation
-- `src/live_infer.py`: shared artifact loader and live streaming detector
-- `src/dataset.py`: dataset build plus forecasting targets
-- `src/train.py`: mode-aware training and threshold fitting
-- `src/evaluate.py`: three-mode evaluation, candidate/confirmed logic, GPT/Telegram hooks
-- `src/gpt_adjudicator.py`: GPT payloads now include mode and component scores
-- `src/telegram_utils.py`: Telegram alerts now include mode and hybrid score context
-- `prometheus/direct_prometheus_infer.py`: Prometheus live path with adaptive thresholds, consecutive confirmation, GPT, and Telegram
-- `product/inference_service.py`: live service path using the shared hybrid detector
-
-## Artifacts
-
-Training writes:
-
-- `reconstruction_model.pt`
-- `film_ae.pt` (legacy reconstruction-compatible name)
-- `forecasting_model.pt`
-- `x_scaler.joblib`
-- `c_scaler.joblib`
-- `detector_meta.json` / `detector_meta.joblib`
-- `threshold_config.json`
-
-Dataset build writes:
-
-- `X_train.npy`, `X_test.npy`
-- `C_train.npy`, `C_test.npy`
-- `X_forecast_train.npy`, `X_forecast_test.npy`
-- `y_forecast_train.npy`, `y_forecast_test.npy`
-
-## Live Behavior
-
-The live Prometheus path keeps:
-
-- per-entity rolling dynamic thresholds
-- candidate vs confirmed anomaly states
-- consecutive breach confirmation
-- smoothing
-- cooldown suppression
-- GPT calls only for confirmed anomalies
-- Telegram alerts only for confirmed anomalies
-
-Each logged decision includes mode, component scores, final score, thresholds, z-score context, volatility context, consecutive breach count, GPT status, and Telegram status.
-
-## GPT / Telegram
-
-Required env vars:
-
-```powershell
-$env:OPENAI_API_KEY="..."
-$env:OPENAI_MODEL="gpt-4.1-mini"
-$env:TELEGRAM_BOT_TOKEN="..."
-$env:TELEGRAM_CHAT_ID="..."
+### 2. Launch JupyterLab
+```bash
+python -m jupyter lab --notebook-dir=alibaba_trace
 ```
 
-GPT receives:
+### 3. Run notebooks in order
+| Notebook | Purpose |
+|----------|---------|
+| `01_Model_Training` | Train dual-head BiLSTM-FiLM → saves `outputs/dual_head_model.pt` |
+| `02_Evaluation_and_Thesis_Graphs` | Score distributions, 300 DPI thesis figures |
+| `03_Alerting_and_RCA_Prototype` | Prometheus webhooks + Telegram alerts |
+| `04_Data_Injection_and_Accuracy_Testing` | Controlled FiLM context validation |
+| `05_GenAI_RCA_Integration` | Gemini/OpenAI root cause analysis |
 
-- entity
-- mode
-- score / threshold context
-- top features
-- decision reason
+> **DEMO mode:** All notebooks work without the Alibaba archive.
+> Synthetic normal data is generated automatically.
 
-Telegram includes:
+## Features
 
-- entity
-- mode
-- reconstruction / forecasting / final scores when available
-- threshold context
-- decision reason
-- GPT summary when available
+| Feature | Value |
+|---------|-------|
+| Time-series features | 7 (CPU, Mem, Net In/Out, Disk I/O, CPU/Mem Request) |
+| Metadata features (FiLM) | 2 (container_id, machine_id) |
+| Window size | 50 timesteps |
+| Stride | 10 rows |
+| Latent dimension | 64 |
+| Total parameters | ~705,000 |
 
-## Regenerate Notebooks
-
-```powershell
-.\venv\Scripts\python.exe .\generate_research_notebooks.py
+## Environment Variables (`.env`)
+```
+TELEGRAM_BOT_TOKEN=your_token
+TELEGRAM_CHAT_ID=your_chat_id
+GEMINI_API_KEY=your_key
+OPENAI_API_KEY=your_key
 ```

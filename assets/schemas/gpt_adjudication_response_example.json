@@ -1,6 +1,0 @@
-{
-  "label": "fault_candidate",
-  "severity": "medium",
-  "explanation": "The anomaly score is materially above threshold and the dominant deviations are concentrated in cpu_util, mem_util, and disk_io, which is consistent with a credible container-side resource fault rather than random noise.",
-  "recommended_action": "Inspect recent workload changes, correlate the flagged metrics with container logs, and check whether the host is under resource contention."
-}
