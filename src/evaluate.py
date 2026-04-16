@@ -22,7 +22,7 @@ from sklearn.metrics import (
 import torch
 
 try:
-    from config import EvalConfig, GPTConfig
+    from config import EvalConfig, GPTConfig, GenAIConfig
     from gpt_adjudicator import adjudicate_anomaly, build_window_summary, compare_ae_vs_gpt_decisions
     from hybrid_scoring import (
         available_modes,
@@ -34,9 +34,10 @@ try:
     )
     from live_infer import StreamingHybridAnomalyDetector, load_model_artifacts
     from telegram_utils import format_telegram_alert, send_telegram_message
+    from two_tier_verifier import TwoTierVerifier
     from utils import apply_3d_scaler, build_prediction_frame, ensure_directory, safe_literal_list, write_json
 except ImportError:
-    from .config import EvalConfig, GPTConfig
+    from .config import EvalConfig, GPTConfig, GenAIConfig
     from .gpt_adjudicator import adjudicate_anomaly, build_window_summary, compare_ae_vs_gpt_decisions
     from .hybrid_scoring import (
         available_modes,
@@ -48,6 +49,7 @@ except ImportError:
     )
     from .live_infer import StreamingHybridAnomalyDetector, load_model_artifacts
     from .telegram_utils import format_telegram_alert, send_telegram_message
+    from .two_tier_verifier import TwoTierVerifier
     from .utils import apply_3d_scaler, build_prediction_frame, ensure_directory, safe_literal_list, write_json
 
 
@@ -467,7 +469,17 @@ def run_streaming_inference_flow(
     prediction_frame: pd.DataFrame,
     config: EvalConfig,
     gpt_config: GPTConfig | None = None,
+    genai_config: GenAIConfig | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Apply streaming decision logic and optionally invoke Tier-2 GenAI Auditor.
+
+    Priority:
+      1. If ``genai_config`` is provided → Two-Tier Verification path
+         (Gemini-first, OpenAI fallback, with full provenance columns).
+      2. Elif ``gpt_config`` is provided  → legacy OpenAI-only path.
+      3. Else                             → Tier-1 only (no LLM calls).
+    """
     stream_df = apply_streaming_decision_logic(
         prediction_frame=prediction_frame,
         static_threshold=float(prediction_frame["static_threshold"].iloc[0]),
@@ -476,24 +488,73 @@ def run_streaming_inference_flow(
     gpt_rows: list[dict[str, Any]] = []
     stream_rows: list[dict[str, Any]] = []
 
+    # Build TwoTierVerifier once if genai_config is supplied
+    verifier: TwoTierVerifier | None = (
+        TwoTierVerifier(config=genai_config) if genai_config is not None else None
+    )
+
     for _, row in stream_df.iterrows():
         record = row.to_dict()
         payload = extract_compact_alert_payload(record)
         summary = build_window_summary(payload)
         record["compact_anomaly_summary"] = json_dumps(summary)
+        is_confirmed = record.get("decision") == "confirmed_anomaly"
+
+        record["tier1_flagged"] = is_confirmed
+        record["tier2_triggered"] = False
+        record["tier2_provider"] = None
+        record["tier2_latency_ms"] = None
+        record["final_label"] = None
+        record["final_severity"] = None
         record["gpt_triggered"] = False
-        if record.get("decision") == "confirmed_anomaly" and gpt_config is not None:
+
+        if is_confirmed and verifier is not None:
+            # ── Two-Tier Verification path ────────────────────────────────
+            result = verifier.verify(
+                record=record,
+                recent_logs=None,
+                recent_events=None,
+            )
+            record.update({
+                "tier2_triggered": result.tier2_triggered,
+                "tier2_provider": result.tier2_provider,
+                "tier2_model": result.tier2_model,
+                "tier2_latency_ms": result.tier2_latency_ms,
+                "tier2_used_fallback": result.tier2_used_fallback,
+                "tier2_fallback_reason": result.tier2_fallback_reason,
+                "final_label": result.final_label,
+                "final_severity": result.final_severity,
+                "final_root_cause": result.final_root_cause,
+                "final_impact_analysis": result.final_impact_analysis,
+                "final_explanation": result.final_explanation,
+                "final_recommended_action": result.final_recommended_action,
+                # backward-compat aliases
+                "gpt_triggered": result.tier2_triggered,
+                "gpt_label": result.final_label,
+                "gpt_severity": result.final_severity,
+                "gpt_recommended_action": result.final_recommended_action,
+                "gpt_explanation": result.final_explanation,
+            })
+            if result.tier2_triggered:
+                gpt_rows.append({**record, "label": result.final_label,
+                                  "severity": result.final_severity})
+
+        elif is_confirmed and gpt_config is not None:
+            # ── Legacy OpenAI-only path ───────────────────────────────────
             adjudicated = adjudicate_anomaly(payload, config=gpt_config)
             gpt_rows.append(adjudicated)
-            record.update(
-                {
-                    "gpt_triggered": True,
-                    "gpt_label": adjudicated["label"],
-                    "gpt_severity": adjudicated["severity"],
-                    "gpt_recommended_action": adjudicated["recommended_action"],
-                    "gpt_explanation": adjudicated["explanation"],
-                }
-            )
+            record.update({
+                "gpt_triggered": True,
+                "gpt_label": adjudicated["label"],
+                "gpt_severity": adjudicated["severity"],
+                "gpt_recommended_action": adjudicated["recommended_action"],
+                "gpt_explanation": adjudicated["explanation"],
+                "final_label": adjudicated["label"],
+                "final_severity": adjudicated["severity"],
+                "tier2_triggered": True,
+                "tier2_provider": adjudicated.get("genai_provider", "openai"),
+            })
+
         stream_rows.append(record)
 
     stream_output = pd.DataFrame(stream_rows)
@@ -618,6 +679,7 @@ def _save_score_plots(mode_dir: Path, stream_df: pd.DataFrame) -> dict[str, str]
 def evaluate_model(
     config: EvalConfig | None = None,
     gpt_config: GPTConfig | None = None,
+    genai_config: GenAIConfig | None = None,
 ) -> dict[str, Any]:
     config = config or EvalConfig()
     started_at = perf_counter()
@@ -700,10 +762,18 @@ def evaluate_model(
         prediction_frame["static_threshold"] = float(static_threshold)
         prediction_frame["event_id"] = event_ids.astype(int)
 
+        # Resolve genai_config for Two-Tier Verification path
+        _genai_config: GenAIConfig | None = None
+        if config.include_tier2_in_stream:
+            _genai_config = genai_config if genai_config is not None else GenAIConfig(
+                output_dir=config.output_dir
+            )
+
         stream_df, gpt_df, comparison_df = run_streaming_inference_flow(
             prediction_frame=prediction_frame,
             config=config,
             gpt_config=gpt_config if config.include_gpt_in_stream else None,
+            genai_config=_genai_config,
         )
         confirmed_alerts = stream_df[stream_df["decision"] == "confirmed_anomaly"].copy()
         predicted_labels = stream_df["predicted_label"].to_numpy(dtype=np.int32)

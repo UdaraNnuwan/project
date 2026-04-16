@@ -7,10 +7,10 @@ from typing import Any
 import pandas as pd
 
 try:
-    from config import GPTConfig
+    from config import GPTConfig, GenAIConfig
     from utils import ensure_directory, safe_literal_list, write_json
 except ImportError:
-    from .config import GPTConfig
+    from .config import GPTConfig, GenAIConfig
     from .utils import ensure_directory, safe_literal_list, write_json
 
 
@@ -313,14 +313,62 @@ def call_openai_responses_api(
     }
 
 
+def call_via_genai_router(
+    summary: dict[str, Any],
+    genai_config: "GenAIConfig",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Delegate to the unified GenAI router (Gemini-first by default).
+
+    This is the Two-Tier Verification Tier-2 call path. It will attempt the
+    provider configured in ``genai_config.provider`` and cross-fall back
+    automatically on failure.
+    """
+    try:
+        from genai_auditor import route_genai_call  # type: ignore[import]
+    except ImportError:
+        from .genai_auditor import route_genai_call  # type: ignore[import]
+
+    return route_genai_call(summary=summary, config=genai_config)
+
+
 def adjudicate_anomaly(
     record: dict[str, Any],
     config: GPTConfig,
     recent_logs: list[str] | None = None,
     recent_events: list[dict[str, Any]] | None = None,
+    genai_config: "GenAIConfig | None" = None,
 ) -> dict[str, Any]:
+    """
+    Adjudicate a single anomaly record via LLM.
+
+    Parameters
+    ----------
+    record : dict
+        The anomaly window record (output of build_prediction_frame / stream).
+    config : GPTConfig
+        Legacy OpenAI config — used when ``genai_config`` is None.
+    recent_logs : list[str], optional
+        Recent log lines for context enrichment.
+    recent_events : list[dict], optional
+        Recent Kubernetes events for context enrichment.
+    genai_config : GenAIConfig, optional
+        When provided, routes through the Two-Tier Verification GenAI Auditor
+        (Gemini-first) instead of the legacy OpenAI-only path.
+    """
     summary = build_window_summary(record, recent_logs=recent_logs, recent_events=recent_events)
-    decision, call_meta = call_openai_responses_api(summary, config=config)
+
+    if genai_config is not None:
+        # ── Two-Tier Verification: GenAI router path ──────────────────────
+        decision, call_meta = call_via_genai_router(summary, genai_config)
+        provider = call_meta.get("provider", genai_config.provider)
+        model_used = call_meta.get("model", "")
+    else:
+        # ── Legacy: OpenAI-only path (unchanged) ──────────────────────────
+        decision, call_meta = call_openai_responses_api(summary, config=config)
+        provider = "openai"
+        model_used = call_meta.get("model", config.model)
+
     return {
         **record,
         "gpt_input_summary": summary,
@@ -333,10 +381,12 @@ def adjudicate_anomaly(
         "explanation": decision["explanation"],
         "recommended_action": decision["recommended_action"],
         "used_fallback": bool(call_meta.get("used_fallback", False)),
-        "gpt_model": call_meta.get("model", config.model),
+        "genai_provider": provider,
+        "gpt_model": model_used,
         "response_id": call_meta.get("response_id"),
         "call_reason": call_meta.get("reason"),
         "call_error": call_meta.get("error"),
+        "tier2_latency_ms": call_meta.get("latency_ms"),
     }
 
 

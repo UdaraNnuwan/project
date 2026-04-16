@@ -2,6 +2,7 @@ joblib
 matplotlib
 numpy
 openai
+google-generativeai>=0.8.0
 pandas
 python-telegram-bot
 python-dotenv

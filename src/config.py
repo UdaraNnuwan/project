@@ -285,7 +285,8 @@ class EvalConfig:
     synthetic_noise_std: float = 0.6
     relaxed_detection_tolerance: int = 2
     use_synthetic_injection: bool = True
-    include_gpt_in_stream: bool = False
+    include_gpt_in_stream: bool = False      # legacy: OpenAI-only path
+    include_tier2_in_stream: bool = False    # new: Two-Tier Verification path
     telegram_enabled: bool = False
     telegram_critical_only: bool = True
     telegram_require_gpt_reason: bool = True
@@ -364,6 +365,88 @@ class GPTConfig:
         return payload
 
 
+@dataclass
+class GenAIConfig:
+    """
+    Unified configuration for Two-Tier Verification GenAI Auditor.
+
+    Supports Google Gemini (primary) and OpenAI GPT (fallback) via a single
+    ``provider`` field. Set GENAI_PROVIDER=openai to flip the priority.
+    """
+
+    # ── Provider selection ────────────────────────────────────────────────
+    provider: str = field(
+        default_factory=lambda: env_str("GENAI_PROVIDER", "gemini")
+    )
+
+    # ── Google Gemini ─────────────────────────────────────────────────────
+    gemini_api_key_env: str = "GEMINI_API_KEY"
+    gemini_model_env: str = "GEMINI_MODEL"
+    gemini_default_model: str = "gemini-2.0-flash"
+
+    # ── OpenAI GPT (fallback) ─────────────────────────────────────────────
+    openai_api_key_env: str = "OPENAI_API_KEY"
+    openai_model_env: str = "OPENAI_MODEL"
+    openai_default_model: str = "gpt-4.1-mini"
+
+    # ── Tier-1 gate ───────────────────────────────────────────────────────
+    tier1_min_score_ratio: float = field(
+        default_factory=lambda: env_float("TIER1_MIN_SCORE_RATIO", 1.05)
+    )
+
+    # ── Tier-2 toggle ─────────────────────────────────────────────────────
+    tier2_enabled: bool = field(
+        default_factory=lambda: env_str("TIER2_ENABLED", "true").lower()
+        not in {"0", "false", "no"}
+    )
+
+    # ── Shared settings ───────────────────────────────────────────────────
+    max_records: int = 100
+    top_k_features: int = 5
+    request_timeout_seconds: int = 60
+    prompt_template_path: Path | None = field(
+        default_factory=lambda: (
+            env_path("CONTAINER_AD_GPT_PROMPT_PATH", PROJECT_ROOT / "gpt_prompt.txt")
+            if os.getenv("CONTAINER_AD_GPT_PROMPT_PATH")
+            else None
+        )
+    )
+    output_dir: Path = field(
+        default_factory=lambda: env_path(
+            "CONTAINER_AD_GPT_RESULTS_DIR",
+            RESULTS_DIR,
+        )
+    )
+
+    @property
+    def gemini_api_key(self) -> str | None:
+        return os.getenv(self.gemini_api_key_env)
+
+    @property
+    def gemini_model(self) -> str:
+        return os.getenv(self.gemini_model_env, self.gemini_default_model)
+
+    @property
+    def openai_api_key(self) -> str | None:
+        return os.getenv(self.openai_api_key_env)
+
+    @property
+    def openai_model(self) -> str:
+        return os.getenv(self.openai_model_env, self.openai_default_model)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["output_dir"] = str(self.output_dir)
+        payload["prompt_template_path"] = (
+            str(self.prompt_template_path) if self.prompt_template_path else None
+        )
+        payload["gemini_model"] = self.gemini_model
+        payload["openai_model"] = self.openai_model
+        payload["gemini_api_key_present"] = bool(self.gemini_api_key)
+        payload["openai_api_key_present"] = bool(self.openai_api_key)
+        return payload
+
+
 CONFIG = {
     "project_root": str(PROJECT_ROOT),
     "data_dir": str(DATA_DIR),
@@ -375,4 +458,5 @@ CONFIG = {
     "train": TrainConfig().to_dict(),
     "evaluate": EvalConfig().to_dict(),
     "gpt": GPTConfig().to_dict(),
+    "genai": GenAIConfig().to_dict(),
 }
