@@ -60,8 +60,9 @@ import json
 import uuid
 import logging
 import datetime
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -846,6 +847,437 @@ class SeverityScorer:
 
 
 # ===========================================================================
+# ─── COMPONENT 1b: AdaptiveThresholdEngine ───────────────────────────────────
+# ===========================================================================
+
+class AdaptiveThresholdEngine:
+    """
+    Continuous Adaptive Threshold Engine via Sliding Window (Concept Drift
+    Mitigation).
+
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    MATHEMATICAL INTUITION
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Let  Θ_static  be a static P95 threshold calibrated once on a baseline
+    normal sample  N₀.  Under *concept drift*, the underlying data
+    distribution P(X) shifts over time:
+
+        P(X, t₀)  ≠  P(X, t₁)   for  t₁ >> t₀
+
+    This causes two failure modes:
+
+      1. *False positive inflation* — if baseline behaviour becomes more
+         active over time (e.g., traffic growth), Θ_static becomes
+         *too conservative* and fires alerts on ordinary elevated load.
+
+      2. *False negative stagnation* — if the new normal is genuinely
+         higher-amplitude than the training baseline, anomalies that
+         exceed the old Θ_static may still fall within the new normal
+         distribution, masking real incidents.
+
+    SLIDING WINDOW REMEDY
+    ─────────────────────
+    We maintain a fixed-capacity FIFO queue  W  of the last  N_w  **normal**
+    MSE observations:
+
+        W = {e₁, e₂, …, e_{N_w}}    (only confirmed-normal scores)
+
+    Thresholds are recomputed every  Δ  inferences as empirical quantiles
+    of  W:
+
+        Θ_{p95}(t)  =  Q_{0.95}(W_t)
+        Θ_{p98}(t)  =  Q_{0.98}(W_t)
+        Θ_{p995}(t) =  Q_{0.995}(W_t)
+
+    where  Q_q  denotes the q-th empirical percentile.
+
+    CONTAMINATION GUARD (Critical Design Choice)
+    ─────────────────────────────────────────────
+    An MSE score is admitted to  W  **if and only if** it was classified
+    as "Normal" using the *current* thresholds at observation time.  This
+    prevents the classic *self-poisoning* failure:
+
+        If anomalous e_a were admitted:
+          Q_{0.95}(W ∪ {e_a}) > Q_{0.95}(W)   → threshold inflates
+          → future anomalies go undetected     → silent detection failure
+
+    The FIFO eviction policy (``collections.deque(maxlen=N_w)``) ensures
+    the window tracks *recent* behaviour; old observations automatically
+    age out as new normal data arrives.
+
+    EPOCH-BASED UPDATES
+    ───────────────────
+    Recomputing  Θ  after every single observation is O(N_w log N_w)  and
+    unnecessary.  We recompute every  ``update_every``  new admissions,
+    giving amortised O(1) per-inference overhead.
+
+    COLD-START HANDLING
+    ───────────────────
+    Until the window contains at least  ``min_window``  observations the
+    engine falls back to the initial static thresholds derived from the
+    calibration baseline, ensuring safe operation from the very first
+    inference.
+
+    Parameters
+    ----------
+    baseline_mse : np.ndarray
+        1-D array of normal reconstruction errors collected at calibration
+        time (e.g., from ``SeverityScorer.calibrate()``).  Used to seed
+        the window and compute initial thresholds.
+    window_size : int
+        Maximum number of normal observations held in  W.  Default 10 000
+        balances memory (≈ 80 KB of float64) against adaptation speed.
+        Larger values → smoother / slower adaptation.  Typical range:
+        5 000 – 50 000 depending on inference throughput.
+    min_window : int
+        Minimum admissions required before adaptive thresholds are
+        activated.  Below this count the engine uses static calibration
+        thresholds (cold-start safety net).  Default: 200.
+    update_every : int
+        Number of newly admitted normal observations between threshold
+        recalculations.  Default: 50 (i.e., recalculate every 50 normals).
+    quantiles : tuple[float, float, float]
+        Percentile levels for (Warning, High, Critical) thresholds.
+        Default: (95.0, 98.0, 99.5).
+
+    Attributes
+    ----------
+    p95, p98, p995 : float
+        Current adaptive threshold values (updated lazily).
+    total_observed : int
+        Total number of MSE values passed to ``observe()``.
+    total_admitted : int
+        Number of *normal* observations admitted to the window.
+    total_rejected : int
+        Number of anomalous observations rejected from the window.
+    drift_magnitude : float
+        Ratio of current P95 to initial P95.  Values > 1.05 indicate
+        upward drift; values < 0.95 indicate downward drift / improvement.
+    """
+
+    def __init__(
+        self,
+        baseline_mse: np.ndarray,
+        window_size:  int   = 10_000,
+        min_window:   int   = 200,
+        update_every: int   = 50,
+        quantiles:    Tuple[float, float, float] = (95.0, 98.0, 99.5),
+    ) -> None:
+        arr = np.asarray(baseline_mse, dtype=np.float64).ravel()
+        if len(arr) < 4:
+            raise ValueError(
+                f"AdaptiveThresholdEngine requires ≥ 4 baseline samples, got {len(arr)}."
+            )
+
+        self._window_size  = int(window_size)
+        self._min_window   = int(min_window)
+        self._update_every = int(update_every)
+        self._q            = tuple(quantiles)   # (p95_level, p98_level, p995_level)
+
+        # ── Sliding FIFO window — core data structure ─────────────────────────
+        # ``deque(maxlen=N)`` automatically evicts the oldest entry when a new
+        # element is appended beyond capacity.  O(1) append and pop.
+        # We seed the window with the calibration baseline so the engine is
+        # immediately operational without needing a warm-up period.
+        seed = arr[-self._window_size:]  # keep the most recent N baseline points
+        self._window: Deque[float] = deque(seed.tolist(), maxlen=self._window_size)
+
+        # ── Compute initial (static) thresholds from the full baseline ────────
+        # These are used during the cold-start phase (< min_window admissions
+        # from live inference) and as the baseline reference for drift detection.
+        self._initial_p95  = float(np.percentile(arr, self._q[0]))
+        self._initial_p98  = float(np.percentile(arr, self._q[1]))
+        self._initial_p995 = float(np.percentile(arr, self._q[2]))
+
+        # Active thresholds — start at static values, updated adaptively
+        self.p95:  float = self._initial_p95
+        self.p98:  float = self._initial_p98
+        self.p995: float = self._initial_p995
+
+        # ── Counters for telemetry and drift reporting ─────────────────────────
+        self.total_observed: int = 0   # all MSE values seen (normal + anomalous)
+        self.total_admitted: int = 0   # normal observations → admitted to window
+        self.total_rejected: int = 0   # anomalous observations → rejected
+
+        # Tracks how many new admissions have occurred since the last
+        # threshold recalculation (lazy recomputation for efficiency).
+        self._admissions_since_update: int = 0
+
+        logger.info(
+            "AdaptiveThresholdEngine initialised | window_size=%d | "
+            "min_window=%d | update_every=%d | "
+            "initial P95=%.6f P98=%.6f P99.5=%.6f",
+            self._window_size, self._min_window, self._update_every,
+            self.p95, self.p98, self.p995,
+        )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Public interface
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def score(self, mse: float) -> str:
+        """
+        Classify an MSE value using the **current adaptive thresholds**.
+
+        Severity mapping (mirrors ``SeverityScorer.score()``):
+
+          Normal   : mse < p95
+          Warning  : p95 ≤ mse < p98
+          High     : p98 ≤ mse < p99.5
+          Critical : mse ≥ p99.5
+
+        Parameters
+        ----------
+        mse : float — reconstruction mean-squared error for one window
+
+        Returns
+        -------
+        str — one of "Normal" | "Warning" | "High" | "Critical"
+        """
+        if mse >= self.p995: return "Critical"
+        if mse >= self.p98:  return "High"
+        if mse >= self.p95:  return "Warning"
+        return "Normal"
+
+    def observe(self, mse: float, severity: str) -> bool:
+        """
+        Submit one inference result to the adaptive engine.
+
+        CONTAMINATION GUARD
+        -------------------
+        Only observations classified as **"Normal"** are admitted to the
+        sliding window.  Anomalous scores (Warning / High / Critical) are
+        explicitly **rejected** to prevent threshold inflation:
+
+          • If we allowed anomalous e_a into W, the distribution of W
+            would shift rightward, raising Q_{0.95}(W) and making the
+            engine progressively less sensitive — a silent degradation.
+
+          • By gating on severity == "Normal", we ensure W tracks only
+            the *baseline distribution of normal system behaviour*,
+            which is exactly the quantity we want our thresholds to
+            adapt to.
+
+        After admitting a normal observation, the method triggers a
+        lazy threshold recomputation every ``update_every`` admissions.
+
+        Parameters
+        ----------
+        mse      : float — the MSE score for this inference window
+        severity : str   — the severity label previously assigned to mse
+                           (from ``AdaptiveThresholdEngine.score()`` or
+                           ``SeverityScorer.score()``).
+
+        Returns
+        -------
+        bool — True if the observation was admitted (was Normal);
+               False if it was rejected (was anomalous).
+        """
+        self.total_observed += 1
+
+        if severity != "Normal":
+            # ── Anomalous observation — REJECTED from window ──────────────
+            # The MSE is above the current P95.  Admitting it would shift
+            # the empirical distribution rightward, inflating future
+            # thresholds and masking subsequent anomalies.
+            self.total_rejected += 1
+            return False
+
+        # ── Normal observation — ADMITTED to sliding window ────────────────
+        # The deque automatically evicts the oldest element if we are at
+        # capacity, implementing the FIFO sliding window semantics.
+        self._window.append(float(mse))
+        self.total_admitted += 1
+        self._admissions_since_update += 1
+
+        # Lazy recomputation: only recalculate when enough new normal
+        # observations have accumulated.  This amortises the O(N log N)
+        # sorting cost of np.percentile over ``update_every`` admissions.
+        if self._admissions_since_update >= self._update_every:
+            self.update_thresholds()
+
+        return True
+
+    def update_thresholds(self) -> None:
+        """
+        Recompute adaptive thresholds from the current sliding window.
+
+        MATHEMATICAL OPERATION
+        ----------------------
+        Let  W = {e₁, …, e_k}  be the current window contents (k ≤ N_w).
+
+        We compute the empirical q-quantile as:
+
+            Q_q(W) = e_{ ⌈q·k⌉ }   (linear interpolation via numpy)
+
+        where the elements are sorted in ascending order.  This gives:
+
+            Θ_{p95}  ← Q_{0.95}(W)     (new Warning boundary)
+            Θ_{p98}  ← Q_{0.98}(W)     (new High boundary)
+            Θ_{p995} ← Q_{0.995}(W)    (new Critical boundary)
+
+        COLD-START GUARD
+        ----------------
+        If the window holds fewer than ``min_window`` *live* observations
+        (i.e., post-seeding admissions < min_window), the static initial
+        thresholds are kept.  This prevents the engine from adapting to
+        an insufficiently representative sample.
+
+        This method is called automatically by ``observe()`` every
+        ``update_every`` admissions, but can also be called manually
+        (e.g., after a batch of forced admissions).
+        """
+        # Cold-start: insufficient live data — keep static thresholds
+        if self.total_admitted < self._min_window:
+            logger.debug(
+                "AdaptiveThreshold cold-start: admitted=%d < min_window=%d "
+                "— keeping static thresholds.",
+                self.total_admitted, self._min_window,
+            )
+            return
+
+        # Convert deque to numpy for vectorised percentile computation.
+        # np.array(deque) avoids a redundant copy — deque → list → array
+        # would create two intermediate objects; list() is implicit here.
+        w_arr = np.array(self._window, dtype=np.float64)
+
+        prev_p95 = self.p95  # save for drift logging
+
+        # Compute empirical percentiles using linear interpolation (numpy
+        # default), which is consistent with the scipy / pandas convention.
+        self.p95  = float(np.percentile(w_arr, self._q[0]))
+        self.p98  = float(np.percentile(w_arr, self._q[1]))
+        self.p995 = float(np.percentile(w_arr, self._q[2]))
+
+        self._admissions_since_update = 0  # reset lazy counter
+
+        drift = self.drift_magnitude
+        logger.info(
+            "AdaptiveThreshold updated | window=%d/%d | "
+            "P95: %.6f → %.6f (drift=%.3f×) | "
+            "P98=%.6f P99.5=%.6f | "
+            "admitted=%d rejected=%d",
+            len(self._window), self._window_size,
+            prev_p95, self.p95, drift,
+            self.p98, self.p995,
+            self.total_admitted, self.total_rejected,
+        )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Telemetry
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @property
+    def drift_magnitude(self) -> float:
+        """
+        Ratio of the current adaptive P95 to the initial static P95.
+
+        Interpretation:
+          drift_magnitude = 1.00 → no drift; thresholds unchanged.
+          drift_magnitude > 1.05 → upward drift; system is busier than
+                                   baseline (e.g., traffic growth).
+          drift_magnitude < 0.95 → downward drift; system has improved
+                                   (e.g., after an optimisation deploy).
+
+        A value persistently > 1.3 or < 0.7 may warrant re-training.
+        """
+        if self._initial_p95 == 0.0:
+            return 1.0
+        return round(self.p95 / self._initial_p95, 4)
+
+    @property
+    def window_fill_pct(self) -> float:
+        """Fraction of the sliding window currently populated (0–100)."""
+        return round(len(self._window) / self._window_size * 100, 1)
+
+    @property
+    def anomaly_rate(self) -> float:
+        """Empirical anomaly rate = rejected / total_observed (0–1)."""
+        if self.total_observed == 0:
+            return 0.0
+        return round(self.total_rejected / self.total_observed, 4)
+
+    @property
+    def is_warm(self) -> bool:
+        """True once the window has enough live data to enable adaptation."""
+        return self.total_admitted >= self._min_window
+
+    def threshold_summary(self) -> Dict[str, float]:
+        """
+        Return the current adaptive thresholds and drift statistics.
+
+        Returns
+        -------
+        dict with keys:
+          p95, p98, p99.5         : current adaptive thresholds
+          initial_p95, …          : original static thresholds (baseline)
+          drift_magnitude         : current / initial P95 ratio
+          window_size_current     : number of observations in window
+          window_size_max         : maximum window capacity
+          window_fill_pct         : fill percentage
+          total_observed          : all inferences seen
+          total_admitted          : normal inferences admitted
+          total_rejected          : anomalous inferences rejected
+          anomaly_rate            : rejected / total_observed
+          adaptive_mode           : True if window has passed min_window
+        """
+        return {
+            "p95":                float(self.p95),
+            "p98":                float(self.p98),
+            "p99.5":              float(self.p995),
+            "initial_p95":        float(self._initial_p95),
+            "initial_p98":        float(self._initial_p98),
+            "initial_p99.5":      float(self._initial_p995),
+            "drift_magnitude":    self.drift_magnitude,
+            "window_size_current": len(self._window),
+            "window_size_max":    self._window_size,
+            "window_fill_pct":    self.window_fill_pct,
+            "total_observed":     self.total_observed,
+            "total_admitted":     self.total_admitted,
+            "total_rejected":     self.total_rejected,
+            "anomaly_rate":       self.anomaly_rate,
+            "adaptive_mode":      self.is_warm,
+        }
+
+    def drift_report(self) -> str:
+        """
+        Return a human-readable drift diagnostics summary for thesis
+        documentation, logging, or notebook display.
+        """
+        s = self.threshold_summary()
+        mode = "ADAPTIVE" if s["adaptive_mode"] else "COLD-START (static)"
+        lines = [
+            "─" * 60,
+            f"  AdaptiveThresholdEngine — Concept Drift Report",
+            "─" * 60,
+            f"  Mode             : {mode}",
+            f"  Drift Magnitude  : {s['drift_magnitude']:.4f}×  "
+            f"(initial P95={s['initial_p95']:.6f} → current={s['p95']:.6f})",
+            f"  Adaptive Thresholds:",
+            f"    P95  (Warning ) : {s['p95']:.6f}",
+            f"    P98  (High    ) : {s['p98']:.6f}",
+            f"    P99.5(Critical) : {s['p99.5']:.6f}",
+            f"  Window           : {s['window_size_current']:,} / {s['window_size_max']:,}  "
+            f"({s['window_fill_pct']:.1f}% full)",
+            f"  Inferences Seen  : {s['total_observed']:,}",
+            f"  Admitted (normal): {s['total_admitted']:,}",
+            f"  Rejected (anom.) : {s['total_rejected']:,}",
+            f"  Live Anomaly Rate : {s['anomaly_rate']*100:.2f}%",
+            "─" * 60,
+        ]
+        return "\n".join(lines)
+
+    def __repr__(self) -> str:
+        return (
+            f"AdaptiveThresholdEngine("
+            f"window={len(self._window)}/{self._window_size}, "
+            f"p95={self.p95:.6f}, drift={self.drift_magnitude:.3f}×, "
+            f"admitted={self.total_admitted}, rejected={self.total_rejected})"
+        )
+
+
+# ===========================================================================
 # ─── COMPONENT 2: ContextAwareRCA ────────────────────────────────────────────
 # ===========================================================================
 
@@ -1529,13 +1961,30 @@ class IncidentPipeline:
 
     def __init__(
         self,
-        scorer:  SeverityScorer,
-        rca:     ContextAwareRCA,
-        alerter: AlertGenerator,
+        scorer:           SeverityScorer,
+        rca:              ContextAwareRCA,
+        alerter:          AlertGenerator,
+        adaptive_engine:  Optional[AdaptiveThresholdEngine] = None,
     ) -> None:
-        self.scorer  = scorer
-        self.rca     = rca
-        self.alerter = alerter
+        """
+        Parameters
+        ----------
+        scorer          : SeverityScorer (must be calibrated)
+        rca             : ContextAwareRCA
+        alerter         : AlertGenerator
+        adaptive_engine : AdaptiveThresholdEngine, optional
+            When supplied, the pipeline automatically:
+              1. Scores each MSE with the *adaptive* thresholds.
+              2. Calls ``adaptive_engine.observe(mse, severity)`` to
+                 conditionally admit the observation to the sliding window.
+              3. Triggers lazy threshold recalculation as configured.
+            When None (default), the static ``SeverityScorer`` thresholds
+            are used — backward-compatible with existing notebook code.
+        """
+        self.scorer          = scorer
+        self.rca             = rca
+        self.alerter         = alerter
+        self.adaptive_engine = adaptive_engine
 
     def process(
         self,
@@ -1567,8 +2016,31 @@ class IncidentPipeline:
             )
         event_id = str(uuid.uuid4())
 
-        # Step 1 — Severity classification
-        severity = self.scorer.score(mse_score)
+        # ── Step 1 — Severity classification ──────────────────────────────
+        # If an AdaptiveThresholdEngine is attached, use its current
+        # sliding-window thresholds for scoring.  Otherwise fall back to
+        # the static SeverityScorer calibrated at training time.
+        if self.adaptive_engine is not None:
+            severity = self.adaptive_engine.score(mse_score)
+        else:
+            severity = self.scorer.score(mse_score)
+
+        # ── Step 1b — Feed observation back into the adaptive window ───────
+        # CONTAMINATION GUARD: only *Normal* MSE scores are admitted to the
+        # sliding window.  Anomalous scores are silently rejected here,
+        # preventing threshold drift caused by anomalous training signal.
+        # The adaptive_engine internally triggers update_thresholds() every
+        # ``update_every`` normal admissions (lazy recalculation).
+        if self.adaptive_engine is not None:
+            admitted = self.adaptive_engine.observe(mse_score, severity)
+            logger.debug(
+                "AdaptiveEngine observation: mse=%.6f severity=%s admitted=%s "
+                "window=%d/%d drift=%.3f×",
+                mse_score, severity, admitted,
+                len(self.adaptive_engine._window),
+                self.adaptive_engine._window_size,
+                self.adaptive_engine.drift_magnitude,
+            )
 
         # Step 2 — Context-aware RCA
         rca_result = self.rca.analyze(original, reconstructed, context)
@@ -1728,11 +2200,41 @@ class LLMAnalysis:
     raw_response:   str
     prompt_tokens:  int
     latency_ms:     float
-    success:        bool
-    error_message:  str = ""
+    success:           bool
+    # LLM-assessed severity tier — may override the model's initial tier.
+    # Populated from the SEVERITY: field in the structured LLM response.
+    # Empty string means the LLM did not provide / parsing failed.
+    verified_severity: str  = ""
+    error_message:     str  = ""
+
+    # ── Convenience properties ─────────────────────────────────────────
+
+    @property
+    def is_true_anomaly(self) -> bool:
+        """
+        Boolean gate for the synchronous dispatch flow.
+        Returns True when the LLM verdict is GENUINE ANOMALY.
+        Used by SynchronousAlertDispatcher.run() to decide whether to
+        override the model severity and how to label the alert.
+        """
+        return self.is_genuine()
 
     def is_genuine(self) -> bool:
         return "GENUINE" in self.verdict.upper()
+
+    def effective_severity(self, model_severity: str) -> str:
+        """
+        Return the final severity for the Telegram alert, applying the
+        LLM's override only when a valid level was parsed.
+
+        Priority: LLM verified_severity > model_severity.
+        If the LLM returned FALSE POSITIVE, returns "Normal" regardless.
+        """
+        if "FALSE POSITIVE" in self.verdict.upper():
+            return "Normal"
+        if self.verified_severity in ("Critical", "High", "Warning", "Normal"):
+            return self.verified_severity
+        return model_severity
 
     def confidence_label(self) -> str:
         if self.confidence_pct >= 90: return "Very High"
@@ -1854,6 +2356,7 @@ VERDICT: <GENUINE ANOMALY|FALSE POSITIVE|UNCERTAIN>
 ROOT CAUSE: <Exactly two sentences explaining what happened and why, referencing specific metrics and log entries where applicable.>
 MITIGATION: <Exactly one concrete sentence describing what the on-call engineer should do RIGHT NOW.>
 CONFIDENCE: <Integer percentage 0-100 reflecting your confidence in this analysis>
+SEVERITY: <Critical|High|Warning|Normal> (your assessed severity — may override the model's initial tier based on contextual log evidence and metric trajectories)
 
 Do NOT add any other text, preamble, or explanation outside this format.\
 """
@@ -2238,10 +2741,11 @@ Do NOT add any other text, preamble, or explanation outside this format.\
         Gracefully handles malformed responses.
         """
         import re
-        verdict    = "UNCERTAIN"
-        root_cause = raw_text   # fallback: entire response as root_cause
-        mitigation = "Investigate with kubectl describe pod and review application logs."
-        confidence = 70
+        verdict           = "UNCERTAIN"
+        root_cause        = raw_text   # fallback: entire response as root_cause
+        mitigation        = "Investigate with kubectl describe pod and review application logs."
+        confidence        = 70
+        verified_severity = ""         # populated from SEVERITY: field if present
 
         try:
             # VERDICT
@@ -2250,13 +2754,13 @@ Do NOT add any other text, preamble, or explanation outside this format.\
                 verdict = m.group(1).strip().rstrip(".")
 
             # ROOT CAUSE
-            m = re.search(r"ROOT CAUSE\s*:\s*(.+?)(?:\nMITIGATION|\nCONFIDENCE|$)",
+            m = re.search(r"ROOT CAUSE\s*:\s*(.+?)(?:\nMITIGATION|\nCONFIDENCE|\nSEVERITY|$)",
                           raw_text, re.IGNORECASE | re.DOTALL)
             if m:
                 root_cause = m.group(1).strip()
 
             # MITIGATION
-            m = re.search(r"MITIGATION\s*:\s*(.+?)(?:\nCONFIDENCE|$)",
+            m = re.search(r"MITIGATION\s*:\s*(.+?)(?:\nCONFIDENCE|\nSEVERITY|$)",
                           raw_text, re.IGNORECASE | re.DOTALL)
             if m:
                 mitigation = m.group(1).strip()
@@ -2265,6 +2769,14 @@ Do NOT add any other text, preamble, or explanation outside this format.\
             m = re.search(r"CONFIDENCE\s*:\s*(\d+)", raw_text, re.IGNORECASE)
             if m:
                 confidence = min(100, max(0, int(m.group(1))))
+
+            # SEVERITY — new field; LLM may override the model's initial tier
+            m = re.search(r"SEVERITY\s*:\s*(Critical|High|Warning|Normal)",
+                          raw_text, re.IGNORECASE)
+            if m:
+                # Normalise capitalisation so it exactly matches SeverityScorer labels
+                raw_sev = m.group(1).strip()
+                verified_severity = raw_sev[0].upper() + raw_sev[1:].lower()
 
         except Exception as parse_err:
             logger.warning("LLM response parsing error: %s", parse_err)
@@ -2279,6 +2791,7 @@ Do NOT add any other text, preamble, or explanation outside this format.\
             prompt_tokens=prompt_tokens,
             latency_ms=latency_ms,
             success=success,
+            verified_severity=verified_severity,
         )
 
     def __repr__(self) -> str:
@@ -2297,10 +2810,209 @@ Do NOT add any other text, preamble, or explanation outside this format.\
 # ===========================================================================
 
 def format_telegram_alert(
+    event:             IncidentEvent,
+    llm_analysis:      Optional[LLMAnalysis],
+    threshold_p95:     float,
+    verified_severity: Optional[str]   = None,
+    include_raw_payload: bool          = False,
+) -> str:
+    """
+    Build a rich Telegram HTML alert that clearly separates the Hybrid
+    Model's raw metrics from the GenAI contextual analysis.
+
+    This function produces ONE comprehensive message per incident,
+    designed to be dispatched only AFTER the LLM has completed its
+    analysis (synchronous flow via SynchronousAlertDispatcher).
+
+    Message structure
+    -----------------
+    🚨  [verified_severity] ALERT header
+    ━━━  Container / Pod / Tier metadata
+    📊  Hybrid Model Score block  (raw MSE / threshold / exceedance)
+    ━━━  Divider
+    🤖  GenAI Root Cause Analysis  (verdict / reasoning / confidence)
+    ━━━  Divider
+    💡  Action Required  (LLM mitigation or statistical playbook)
+    🔗  Footer links
+
+    Parameters
+    ----------
+    event             : IncidentEvent      — statistical RCA result
+    llm_analysis      : LLMAnalysis | None — AI analysis (None → model-only)
+    threshold_p95     : float              — P95 threshold for display
+    verified_severity : str, optional      — LLM-verified severity override
+                                             (None → use event.severity)
+    include_raw_payload : bool             — append Prometheus JSON snippet
+
+    Returns
+    -------
+    str — Telegram HTML message (Telegram parse_mode=HTML format)
+    """
+
+    def _esc(s: str) -> str:
+        """Escape Telegram HTML special characters."""
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    ctx = event.context
+
+    # ── Resolve final severity ─────────────────────────────────────────────
+    # Priority: caller-supplied verified_severity > LLM field > model default
+    if verified_severity and verified_severity in ("Critical", "High", "Warning", "Normal"):
+        final_sev = verified_severity
+    elif llm_analysis is not None:
+        final_sev = llm_analysis.effective_severity(event.severity)
+    else:
+        final_sev = event.severity
+
+    SEV_EMOJI = {
+        "Critical": "🚨", "High": "🔴", "Warning": "⚠️", "Normal": "✅",
+    }
+    SEV_LABEL = {
+        "Critical": "CRITICAL ANOMALY",
+        "High":     "HIGH SEVERITY ANOMALY",
+        "Warning":  "WARNING — ELEVATED ANOMALY",
+        "Normal":   "FALSE POSITIVE — Resolved",
+    }
+    sev_emoji = SEV_EMOJI.get(final_sev, "⚠️")
+    sev_label = SEV_LABEL.get(final_sev, final_sev.upper())
+    prof_icon = ctx.profile_icon()
+
+    exceedance = event.mse_score / threshold_p95 if threshold_p95 > 0 else 0.0
+    excess_pct = int((exceedance - 1) * 100) if exceedance > 1 else 0
+
+    # ── Feature breakdown (top-3 bar chart) ───────────────────────────────
+    total_err  = sum(event.feature_errors.values()) or 1e-12
+    top3       = sorted(event.feature_errors.items(), key=lambda x: x[1], reverse=True)[:3]
+    feat_lines = []
+    for feat, err in top3:
+        fm    = FEATURE_META.get(feat, _UNKNOWN_META)
+        e_pct = err / total_err * 100
+        bar   = "█" * max(1, int(e_pct / 10)) + "░" * (10 - max(1, int(e_pct / 10)))
+        feat_lines.append(
+            f"  {fm['icon']} <b>{_esc(fm['short_name']):7s}</b>  "
+            f"{err:.5f}  {e_pct:5.1f}%  {bar}"
+        )
+    feat_table = "\n".join(feat_lines) or "  (no breakdown available)"
+
+    # ── Assemble HTML parts ────────────────────────────────────────────────
+    parts: List[str] = []
+
+    # ── HEADER ────────────────────────────────────────────────────────────
+    parts += [
+        f"{sev_emoji} <b>{_esc(sev_label)}</b>",
+        f"{prof_icon} <b>{_esc(ctx.display_name())}</b> / <i>BiLSTM-FiLM Anomaly Detection</i>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+    ]
+
+    # ── CONTAINER METADATA ────────────────────────────────────────────────
+    parts += [
+        f"📦 <b>Container:</b> <code>{_esc(ctx.container_id)}</code>",
+        f"☸️  <b>Pod:</b>       <code>{_esc(ctx.pod_name)}</code>",
+        f"🗂️  <b>Namespace:</b> <code>{_esc(ctx.namespace)}</code>",
+        f"🏷️  <b>Tier:</b>      {_esc(ctx.tier)} / {_esc(ctx.environment)}",
+        f"🔬 <b>FiLM Vector:</b> <code>{_esc(ctx.film_vector_str())}</code>",
+        f"⏰ <b>Timestamp:</b>  <code>{_esc(event.timestamp_utc)}</code>",
+        "",
+    ]
+
+    # ── BLOCK 1 — HYBRID MODEL SCORE ──────────────────────────────────────
+    # Raw quantitative output from the BiLSTM-FiLM model.  Deliberately
+    # separated from the AI analysis so reviewers can assess each tier
+    # independently during thesis evaluation.
+    parts += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "📊 <b>Hybrid Model Score</b>",
+        f"  • MSE Score:    <code>{event.mse_score:.6f}</code>",
+        f"  • P95 Threshold: <code>{threshold_p95:.6f}</code>  <i>(calibrated)</i>",
+        f"  • Exceedance:   <b>{exceedance:.1f}×</b>  ({excess_pct}% above boundary)",
+        f"  • Model Severity: <b>{_esc(event.severity)}</b>",
+        "",
+        "📉 <b>Feature Error Breakdown (Top 3)</b>",
+        "<pre>",
+        feat_table,
+        "</pre>",
+        "",
+    ]
+
+    # ── BLOCK 2 — GEN AI ROOT CAUSE ANALYSIS ─────────────────────────────
+    # This block is only rendered AFTER the LLM has responded.
+    # It intentionally mirrors the model block's visual weight so both
+    # sources of evidence are equally prominent in the alert card.
+    parts.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    if llm_analysis is not None:
+        ai_label = "🤖 <b>GenAI Root Cause Analysis</b>" if llm_analysis.success \
+                   else "🤖 <b>GenAI Root Cause Analysis</b> <i>(demo mode)</i>"
+
+        # Verdict badge with override note
+        sev_changed = (final_sev != event.severity)
+        sev_note    = (
+            f"  <i>(severity overridden: {_esc(event.severity)} → {_esc(final_sev)})</i>"
+            if sev_changed else ""
+        )
+
+        parts += [
+            ai_label,
+            f"  🔍 <b>Verdict:</b>    <b>{_esc(llm_analysis.verdict)}</b>{sev_note}",
+            f"  🤔 <b>Confidence:</b> {llm_analysis.confidence_pct}%  "
+            f"({_esc(llm_analysis.confidence_label())})",
+            f"  ⚡ <b>Model:</b>      <i>{_esc(llm_analysis.model_used)}</i>  "
+            f"({llm_analysis.latency_ms:.0f} ms)",
+            "",
+            "  <b>🧠 AI Reasoning:</b>",
+            f"  <i>{_esc(llm_analysis.root_cause[:480])}</i>",
+            "",
+        ]
+    else:
+        # LLM not available — note that this is a model-only alert
+        parts += [
+            "🤖 <b>GenAI Root Cause Analysis</b>",
+            "  <i>LLM analysis not available — statistical RCA only.</i>",
+            "",
+        ]
+
+    # ── BLOCK 3 — ACTION REQUIRED ─────────────────────────────────────────
+    # If LLM is available, use its mitigation (concise, context-aware).
+    # Fallback to the statistical playbook's first step.
+    parts.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    if llm_analysis is not None and llm_analysis.mitigation:
+        action_text = llm_analysis.mitigation
+        action_src  = "AI-prescribed"
+    else:
+        action_text = event.recommended_action.split("\n")[0]
+        action_src  = "Playbook step 1"
+
+    parts += [
+        f"💡 <b>Action Required</b>  <i>({action_src})</i>",
+        f"<pre>{_esc(action_text[:300])}</pre>",
+        f"📣 <b>Escalate to:</b>  {_esc(event.escalation_path)}",
+        "",
+    ]
+
+    # ── FOOTER ────────────────────────────────────────────────────────────
+    parts += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f'🔗 <a href="{event.runbook_url}">Open Runbook</a>',
+        f"🆔 Event: <code>{event.event_id[:20]}</code>",
+    ]
+
+    msg = "\n".join(parts)
+
+    # Telegram hard limit is 4096 chars — truncate gracefully
+    if len(msg) > 4000:
+        msg = msg[:3970] + "\n\n<i>… (message truncated)</i>"
+
+    return msg
+
+
+# Legacy plain-text alias kept for backward compatibility with
+# any notebook cells that import format_telegram_alert for print display.
+def format_telegram_alert_plaintext(
     event:        IncidentEvent,
     llm_analysis: Optional[LLMAnalysis],
     threshold_p95: float,
-    include_raw_payload: bool = False,
 ) -> str:
     """
     Format a rich plain-text Telegram alert message combining the statistical
@@ -2469,3 +3181,386 @@ def generate_prometheus_alert_with_ai(
         payload["commonAnnotations"].update(ai_annotations)
 
     return payload
+
+
+# ===========================================================================
+# ─── ORCHESTRATOR: SynchronousAlertDispatcher ────────────────────────────────
+# ===========================================================================
+
+class SynchronousAlertDispatcher:
+    """
+    Strictly synchronous 4-step LLM-gated Telegram alert pipeline.
+
+    EXECUTION FLOW
+    --------------
+    Step 1 — Anomaly gate
+              ``mse_score`` is compared to ``threshold_p95``.
+              If the score does not exceed the threshold, the method
+              returns immediately with ``triggered=False``.
+
+    Step 2 — Synchronous LLM call  (BLOCKING)
+              If the anomaly gate fires, the dispatcher calls
+              ``GenAIRCAEngine.analyze_with_llm()`` and **blocks** until
+              the LLM responds.  This guarantees the Telegram alert is
+              ONE message that already contains the AI analysis — no
+              partial "model fired" followed by a second "AI says…" message.
+
+    Step 3 — Severity resolution
+              The LLM result is inspected via ``LLMAnalysis.effective_severity()``:
+                • GENUINE ANOMALY + LLM severity   → use LLM tier
+                • FALSE POSITIVE                   → downgrade to Normal
+                • UNCERTAIN / parse failure        → keep model severity (safe default)
+
+    Step 4 — Single Telegram dispatch
+              ONE HTML message (``format_telegram_alert``) is built and
+              sent via the Telegram Bot API.  If the LLM call raised a
+              hard exception (escaped ``GenAIRCAEngine``'s own try/except),
+              a fallback ``LLMAnalysis`` is constructed so the message
+              always has consistent content.
+
+    Parameters
+    ----------
+    pipeline       : IncidentPipeline   — statistical RCA engine
+    genai_engine   : GenAIRCAEngine     — LLM provider (Gemini / GPT / demo)
+    threshold_p95  : float              — P95 MSE anomaly gate threshold
+    threshold_p98  : float, optional    — P98 (used for severity display)
+    threshold_p995 : float, optional    — P99.5
+    dry_run        : bool               — if True, build message but skip HTTP POST
+    """
+
+    def __init__(
+        self,
+        pipeline:       IncidentPipeline,
+        genai_engine:   GenAIRCAEngine,
+        threshold_p95:  float,
+        threshold_p98:  float = 0.0,
+        threshold_p995: float = 0.0,
+        dry_run:        bool  = False,
+    ) -> None:
+        self.pipeline       = pipeline
+        self.genai_engine   = genai_engine
+        self.threshold_p95  = float(threshold_p95)
+        self.threshold_p98  = float(threshold_p98)  or float(threshold_p95)
+        self.threshold_p995 = float(threshold_p995) or float(threshold_p95)
+        self.dry_run        = dry_run
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def run(
+        self,
+        original:      np.ndarray,
+        reconstructed: np.ndarray,
+        mse_score:     float,
+        context:       ContainerContext,
+        bot_token:     str           = "",
+        chat_id:       str           = "",
+        recent_logs:   str           = "",
+        timestamp_utc: Optional[str] = None,
+    ) -> Dict:
+        """
+        Execute the 4-step synchronous pipeline for one inference window.
+
+        Parameters
+        ----------
+        original      : np.ndarray (W, F) — original scaled window
+        reconstructed : np.ndarray (W, F) — model reconstruction
+        mse_score     : float             — pre-computed window MSE
+        context       : ContainerContext  — FiLM metadata
+        bot_token     : str               — Telegram Bot API token
+        chat_id       : str               — Telegram chat / channel ID
+        recent_logs   : str               — container log text (simulated or real)
+        timestamp_utc : str, optional     — ISO-8601 timestamp
+
+        Returns
+        -------
+        dict
+          triggered        : bool           — MSE exceeded threshold
+          incident         : IncidentEvent  — statistical RCA record
+          llm_analysis     : LLMAnalysis    — AI analysis result
+          final_severity   : str            — LLM-verified or model severity
+          is_true_anomaly  : bool           — LLM verdict
+          used_fallback    : bool           — True if LLM failed / timed out
+          telegram_result  : dict           — Telegram API response
+          html_message     : str            — the complete HTML card sent
+        """
+        if timestamp_utc is None:
+            timestamp_utc = (
+                datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            )
+
+        result: Dict = {
+            "triggered":       False,
+            "incident":        None,
+            "llm_analysis":    None,
+            "final_severity":  "Normal",
+            "is_true_anomaly": False,
+            "used_fallback":   False,
+            "telegram_result": {"success": False, "error": "not triggered"},
+            "html_message":    "",
+        }
+
+        # ── STEP 1: Anomaly gate ───────────────────────────────────────────
+        if mse_score <= self.threshold_p95:
+            logger.debug(
+                "SynchronousAlertDispatcher: mse=%.6f ≤ threshold=%.6f — no alert.",
+                mse_score, self.threshold_p95,
+            )
+            return result
+
+        result["triggered"] = True
+        logger.info(
+            "SynchronousAlertDispatcher: anomaly gate triggered — "
+            "mse=%.6f (%.1f× threshold=%.6f)",
+            mse_score, mse_score / self.threshold_p95, self.threshold_p95,
+        )
+
+        # ── STEP 1b: Statistical RCA (fast, <5 ms) ────────────────────────
+        incident = self.pipeline.process(
+            original=original, reconstructed=reconstructed,
+            mse_score=mse_score, context=context, timestamp_utc=timestamp_utc,
+        )
+        result["incident"] = incident
+
+        # Build the rca_result dict that GenAIRCAEngine._build_prompt() expects
+        total_err   = sum(incident.feature_errors.values()) or 1e-12
+        rca_for_llm: Dict = {
+            "primary_metric":        incident.primary_metric,
+            "primary_display":       incident.primary_display,
+            "primary_error_percent": (
+                incident.feature_errors.get(incident.primary_metric, 0)
+                / total_err * 100
+            ),
+            "diagnosis":          incident.diagnosis,
+            "recommended_action": incident.recommended_action,
+            "feature_errors":     incident.feature_errors,
+            "feature_errors_ranked": [
+                {
+                    "feature":      k,
+                    "display_name": FEATURE_META.get(k, _UNKNOWN_META)["display_name"],
+                    "short_name":   FEATURE_META.get(k, _UNKNOWN_META)["short_name"],
+                    "icon":         FEATURE_META.get(k, _UNKNOWN_META)["icon"],
+                    "mse":          round(v, 8),
+                    "weighted_mse": round(
+                        v * FEATURE_META.get(k, _UNKNOWN_META)["severity_weight"], 8
+                    ),
+                    "error_pct": round(v / total_err * 100, 2),
+                }
+                for k, v in sorted(
+                    incident.feature_errors.items(), key=lambda x: x[1], reverse=True
+                )
+            ],
+            "context_summary": {},
+        }
+
+        # ── STEP 2: Synchronous LLM call (BLOCKING) ───────────────────────
+        # This call blocks the thread until the LLM responds or the
+        # GenAIRCAEngine's timeout fires.  Telegram dispatch is intentionally
+        # held here — there must be exactly ONE message per incident.
+        llm_analysis:  Optional[LLMAnalysis] = None
+        used_fallback: bool                  = False
+
+        logger.info(
+            "[STEP 2] Calling LLM synchronously — Telegram is BLOCKED "
+            "until this returns (timeout=%gs).",
+            self.genai_engine.timeout_seconds,
+        )
+        try:
+            llm_analysis = self.genai_engine.analyze_with_llm(
+                original_metrics      = original,
+                reconstructed_metrics = reconstructed,
+                mse                   = mse_score,
+                context               = context,
+                rca_result            = rca_for_llm,
+                recent_logs           = recent_logs,
+                threshold_p95         = self.threshold_p95,
+                timestamp_utc         = timestamp_utc,
+            )
+            logger.info(
+                "[STEP 2] LLM returned: verdict=%s verified_severity=%s "
+                "confidence=%d%% latency=%.0f ms",
+                llm_analysis.verdict,
+                llm_analysis.verified_severity or "—",
+                llm_analysis.confidence_pct,
+                llm_analysis.latency_ms,
+            )
+        except Exception as llm_err:
+            # Catastrophic failure that escaped GenAIRCAEngine's own guards.
+            # Build a minimal LLMAnalysis so downstream code always has a
+            # non-None object and the fallback alert is still informative.
+            logger.error(
+                "[STEP 2] LLM raised unexpected exception (%s) — "
+                "building fallback LLMAnalysis.", llm_err,
+            )
+            used_fallback = True
+            llm_analysis  = LLMAnalysis(
+                verdict="UNCERTAIN",
+                root_cause=(
+                    f"LLM call failed ({type(llm_err).__name__}). "
+                    f"Statistical diagnosis: {incident.diagnosis[:200]}"
+                ),
+                mitigation=incident.recommended_action.split("\n")[0],
+                confidence_pct=0,
+                model_used="FALLBACK (LLM unavailable)",
+                raw_response="",
+                prompt_tokens=0,
+                latency_ms=0.0,
+                success=False,
+                verified_severity="",
+                error_message=str(llm_err),
+            )
+
+        result["llm_analysis"]  = llm_analysis
+        result["used_fallback"] = used_fallback
+
+        # ── STEP 3: Severity resolution ────────────────────────────────────
+        # ``effective_severity`` applies LLM override rules:
+        #   GENUINE ANOMALY + llm.verified_severity → use LLM tier
+        #   FALSE POSITIVE                          → Normal
+        #   UNCERTAIN / no severity parsed          → keep model tier
+        model_severity  = incident.severity
+        final_severity  = llm_analysis.effective_severity(model_severity)
+        is_true_anomaly = llm_analysis.is_true_anomaly
+
+        result["final_severity"]  = final_severity
+        result["is_true_anomaly"] = is_true_anomaly
+
+        logger.info(
+            "[STEP 3] Severity resolved — model=%s → final=%s "
+            "(is_true_anomaly=%s, llm_override=%s)",
+            model_severity, final_severity,
+            is_true_anomaly, llm_analysis.verified_severity or "—",
+        )
+
+        # ── STEP 4: Single Telegram dispatch ──────────────────────────────
+        # This is the ONE Telegram call in the entire flow.
+        # The message is built here, AFTER the LLM has returned, and
+        # embeds both the statistical model evidence and the AI analysis
+        # in a single HTML card with clear visual separation.
+        logger.info(
+            "[STEP 4] Dispatching ONE Telegram alert "
+            "(final_severity=%s, dry_run=%s)",
+            final_severity, self.dry_run,
+        )
+
+        html_msg = format_telegram_alert(
+            event             = incident,
+            llm_analysis      = llm_analysis,
+            threshold_p95     = self.threshold_p95,
+            verified_severity = final_severity,
+        )
+        result["html_message"] = html_msg
+
+        tg_result = self._send_telegram(
+            bot_token    = bot_token,
+            chat_id      = chat_id,
+            html_msg     = html_msg,
+            severity     = final_severity,
+            container_id = context.container_id,
+        )
+        result["telegram_result"] = tg_result
+
+        logger.info(
+            "[STEP 4] Telegram dispatch complete — success=%s msg_id=%s",
+            tg_result.get("success"), tg_result.get("message_id"),
+        )
+        return result
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Private helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _send_telegram(
+        self,
+        bot_token:    str,
+        chat_id:      str,
+        html_msg:     str,
+        severity:     str,
+        container_id: str,
+    ) -> Dict:
+        """
+        POST the HTML message to the Telegram Bot API.
+
+        Validates credentials, then makes a single HTTP POST.
+        All exceptions are caught and returned in the result dict —
+        this method never raises, so a Telegram outage cannot block
+        the incident pipeline or prevent the result dict from being returned.
+        """
+        result: Dict = {
+            "success":     False,
+            "message_id":  None,
+            "status_code": 0,
+            "error":       "",
+        }
+
+        # Dry-run: build but do not send
+        if self.dry_run:
+            logger.info(
+                "Telegram DRY-RUN — container=%s severity=%s chars=%d",
+                container_id, severity, len(html_msg),
+            )
+            result["success"] = True
+            result["error"]   = "dry_run — message not sent"
+            return result
+
+        # Guard: placeholder credentials
+        def _bad_cred(key: str) -> bool:
+            return not key or "your" in key.lower() or len(key) < 10
+
+        if _bad_cred(bot_token):
+            result["error"] = "placeholder bot_token — message not sent"
+            logger.warning("SynchronousAlertDispatcher: %s", result["error"])
+            return result
+
+        if not chat_id or "your" in str(chat_id).lower():
+            result["error"] = "placeholder chat_id — message not sent"
+            logger.warning("SynchronousAlertDispatcher: %s", result["error"])
+            return result
+
+        # HTTP POST to Telegram Bot API
+        try:
+            import requests as _req
+
+            api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            payload = {
+                "chat_id":                  str(chat_id),
+                "text":                     html_msg,
+                "parse_mode":               "HTML",
+                "disable_web_page_preview": True,
+                # Critical / High → push notification; Warning / Normal → silent
+                "disable_notification":     severity in ("Warning", "Normal"),
+            }
+            resp = _req.post(api_url, json=payload, timeout=12)
+            result["status_code"] = resp.status_code
+
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("ok"):
+                    result["success"]    = True
+                    result["message_id"] = data.get("result", {}).get("message_id")
+                    logger.info(
+                        "Telegram alert sent — container=%s severity=%s msg_id=%s",
+                        container_id, severity, result["message_id"],
+                    )
+                else:
+                    result["error"] = data.get("description", "Telegram ok=False")
+                    logger.warning("Telegram API error: %s", result["error"])
+            else:
+                result["error"] = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                logger.warning("Telegram HTTP error: %s", result["error"])
+
+        except ImportError:
+            result["error"] = "'requests' not installed — pip install requests"
+            logger.error(result["error"])
+        except Exception as exc:
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            logger.warning("Telegram send failed (non-fatal): %s", result["error"])
+
+        return result
+
+    def __repr__(self) -> str:
+        return (
+            f"SynchronousAlertDispatcher("
+            f"threshold_p95={self.threshold_p95:.6f}, "
+            f"genai={self.genai_engine.gemini_model}, "
+            f"dry_run={self.dry_run})"
+        )

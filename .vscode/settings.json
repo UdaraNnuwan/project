@@ -1,0 +1,5 @@
+﻿{
+    "python.defaultInterpreterPath": "C:\\Users\\kaspe\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
+    "python.terminal.activateEnvironment": false,
+    "jupyter.notebookFileRoot": "${workspaceFolder}/alibaba_trace"
+}
