@@ -6,6 +6,9 @@ import sys
 import torch
 import csv
 import json
+import numpy as np
+from collections import defaultdict, deque
+from sklearn.preprocessing import MinMaxScaler
 
 try:
     from dotenv import load_dotenv
@@ -37,8 +40,16 @@ QUERY_INTERVAL = 10 # seconds
 TIMEOUT = 10 # seconds
 DEFAULT_PROM_URL = "http://35.206.92.147:9090/api/v1/query"
 
-# Example PromQL query: Modify this to extract the relevant metrics for your model
-PROMQL_QUERY = 'rate(container_cpu_usage_seconds_total{image!=""}[5m])'
+# Global buffers and thresholds
+buffers = defaultdict(lambda: deque(maxlen=50))
+loss_histories = defaultdict(lambda: deque(maxlen=100))
+threshold_multiplier = float(os.environ.get("THRESHOLD_MULTIPLIER", 2.0))
+warm_up_cycles = int(os.environ.get("WARM_UP_CYCLES", 10))
+cycle_count = 0
+
+# Modified this to properly match your cAdvisor metrics layout.
+# Your setup doesn't have a 'container' label, it uses 'name'. Also stripping 'pause' images to filter out sandbox POD networks.
+PROMQL_QUERY = 'rate(container_cpu_usage_seconds_total{image!="", image!~".*pause.*", name!=""}[5m])'
 
 # Import Common Notification Interfaces
 try:
@@ -66,12 +77,12 @@ def log_results_to_csv(results, filepath="metrics_log.csv"):
     except Exception as e:
         logger.error(f"Failed to write metrics to CSV: {e}")
 
-# Example PromQL query: Modify this to extract the relevant metrics for your model
-PROMQL_QUERY = 'rate(container_cpu_usage_seconds_total{image!=""}[5m])'
+# Modified this to properly match your cAdvisor metrics layout.
+PROMQL_QUERY = 'rate(container_cpu_usage_seconds_total{image!="", image!~".*pause.*", name!=""}[5m])'
 
 def load_model():
     """
-    Load the DualHeadBiLSTMFiLM model here.
+    Load the DualHeadBiLSTMFiLM model and scaler here.
     """
     logger.info("Loading Dual-Head BiLSTM-FiLM model...")
     
@@ -88,6 +99,24 @@ def load_model():
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found. Checked absolute path: {default_path} and Docker path: dual_head_model.pt")
             
+    # Load scaler
+    scaler_path = os.path.join(os.path.dirname(model_path), "scaler_params.json")
+    if not os.path.exists(scaler_path):
+        scaler_path = "scaler_params.json"
+        if not os.path.exists(scaler_path):
+            raise FileNotFoundError(f"Scaler params not found. Checked {scaler_path}")
+    
+    with open(scaler_path, 'r') as f:
+        scaler_params = json.load(f)
+    
+    scaler = MinMaxScaler()
+    scaler.min_ = np.array(scaler_params['min_'])
+    scaler.scale_ = 1.0 / (np.array(scaler_params['max_']) - np.array(scaler_params['min_']))
+    scaler.data_min_ = scaler.min_
+    scaler.data_max_ = np.array(scaler_params['max_'])
+    scaler.data_range_ = scaler.data_max_ - scaler.data_min_
+    scaler.n_features_in_ = len(scaler.min_)
+    
     # Model parameters as defined during training
     WINDOW_SIZE = 50
     N_TS_FEAT = 7
@@ -105,11 +134,11 @@ def load_model():
         latent_dim=LATENT_DIM,
         device=device
     )
-    return model
+    return model, scaler, device
 
-def fetch_metrics(prom_url):
+def fetch_prometheus_data(prom_url):
     """
-    Fetches metrics from the Prometheus API.
+    Robust fetch function that calls the Prometheus HTTP API endpoint (/api/v1/query).
     """
     try:
         response = requests.get(
@@ -130,15 +159,87 @@ def fetch_metrics(prom_url):
     
     return None
 
-def process_and_infer(model, raw_data):
+def process_and_infer(model, scaler, device, raw_data):
     """
-    Preprocess data and run anomaly detection inference.
+    Preprocess data and run anomaly detection inference using the trained model.
     """
-    # Placeholder for running the actual predictions
-    # 1. Parse 'raw_data' from Prometheus
-    # 2. Window and scale the time-series arrays
-    # 3. Call `predictions = model.predict(processed_data)`
-    # 4. Compute anomaly thresholds/loss and log anomalies
+    global cycle_count
+    
+    # Process each container's metric stream from the current batch
+    for result in raw_data:
+        # Extract the metric dictionary (labels/metadata) to be fed into the FiLM layer
+        labels = result.get('metric', {})
+        container_name = labels.get('container_label_io_kubernetes_pod_name', labels.get('name', labels.get('id', 'unknown')))
+        
+        # Extract the value[1] (the actual float metric) to be fed into the BiLSTM
+        val_data = result.get('value', [])
+        if len(val_data) < 2:
+            continue
+            
+        try:
+            cpu_val = float(val_data[1])
+        except ValueError:
+            logger.error(f"Failed to cast value to float: {val_data[1]}")
+            continue
+            
+        # Basic filter: log an exact 0.0 value as a warning and skip feeding it to the model        
+        if cpu_val == 0.0 or np.isnan(cpu_val):
+            logger.warning(f"⚠️ Skipping container {container_name}. CPU value is {cpu_val}.")
+            continue
+        
+        # Append to buffer
+        buffers[container_name].append(cpu_val)
+        
+        # Only run inference when window is full
+        if len(buffers[container_name]) < 50:
+            continue
+        
+        # Prepare time-series tensor: replicate CPU to 7 features
+        sequence = list(buffers[container_name])
+        ts_features = np.array([[val] * 7 for val in sequence])
+        
+        # Normalize using scaler
+        ts_features = scaler.transform(ts_features.reshape(-1, 7)).reshape(50, 7)
+        
+        ts_tensor = torch.tensor(ts_features).float().unsqueeze(0).to(device)
+        
+        # Prepare metadata tensor
+        meta1 = hash(container_name) % 1000 / 1000.0  # Normalized hash
+        meta2 = 1.0 if 'image' in labels and labels['image'] else 0.0
+        meta_tensor = torch.tensor([[meta1, meta2]]).float().to(device)
+        
+        # Run model inference
+        with torch.no_grad():
+            recon_output, forecast_output = model(ts_tensor, meta_tensor)
+        
+        # Compute MSE loss using reconstruction output
+        mse_loss = torch.mean((recon_output - ts_tensor) ** 2).item()
+        
+        # Append to loss history
+        loss_histories[container_name].append(mse_loss)
+        
+        # Compute dynamic threshold if sufficient history
+        if len(loss_histories[container_name]) >= 10:
+            losses = list(loss_histories[container_name])
+            mean_loss = sum(losses) / len(losses)
+            std_loss = (sum((x - mean_loss) ** 2 for x in losses) / len(losses)) ** 0.5
+            threshold = mean_loss + threshold_multiplier * std_loss
+        else:
+            threshold = float('inf')  # No threshold yet
+        
+        # Determine status
+        if cycle_count > warm_up_cycles and len(loss_histories[container_name]) >= 10:
+            status = "Anomaly" if mse_loss > threshold else "Normal"
+        else:
+            status = "Normal"  # Warm-up or insufficient history
+        
+        # Log the status
+        if status == "Anomaly":
+            logger.warning(f"🚨 STATUS: {status} | Container: {container_name} | MSE: {mse_loss:.4f} > Threshold: {threshold:.4f}")
+            send_telegram_alert(f"🚨 Anomaly Detected!\nContainer: {container_name}\nMSE: {mse_loss:.4f}\nThreshold: {threshold:.4f}")
+        else:
+            logger.info(f"✅ STATUS: {status} | Container: {container_name} | MSE: {mse_loss:.4f} <= Threshold: {threshold:.4f}")
+
     logger.info("Successfully processed batch and ran inference.")
 
 def main():
@@ -153,7 +254,7 @@ def main():
     
     # Load model once at startup to prevent memory leaks and overhead
     try:
-        model = load_model()
+        model, scaler, device = load_model()
     except Exception as e:
         logger.critical(f"Failed to load model. Exiting pod. Error: {e}")
         sys.exit(1)
@@ -162,9 +263,11 @@ def main():
     
     while True:
         start_time = time.time()
+        global cycle_count
+        cycle_count += 1
         
         logger.info(f"Querying Prometheus API with query: {PROMQL_QUERY}")
-        data = fetch_metrics(prom_url)
+        data = fetch_prometheus_data(prom_url)
         
         if data and data.get('status') == 'success':
             results = data.get('data', {}).get('result', [])
@@ -184,7 +287,7 @@ def main():
                     logger.info(f"  [{i+1}/{len(results)}] Container: {container_name} | Labels: {metric_labels} | Data: {value}")
                 
                 try:
-                    process_and_infer(model, results)
+                    process_and_infer(model, scaler, device, results)
                 except Exception as e:
                     # Catch ML-related exceptions so the pod doesn't crash on bad data
                     logger.error(f"Error during inference execution: {e}", exc_info=True)
