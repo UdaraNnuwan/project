@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bilstm-film-inference
+  namespace: default
+  labels:
+    app: anomaly-detector
+    component: ml-inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: anomaly-detector
+  strategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: anomaly-detector
+        component: ml-inference
+    spec:
+      containers:
+      - name: bilstm-inference-pod
+        # Replace this with your actual built image (e.g. gcr.io/my-project/bilstm-inference:v1)
+        image: <YOUR_DOCKER_REGISTRY_URL>/bilstm-film-inference:latest 
+        imagePullPolicy: Always
+        
+        # Explicit overriding of environment variables
+        env:
+        - name: PROM_URL
+          value: "http://35.206.92.147:9090/api/v1/query"
+          
+        # Resource allocations for lightweight ML workloads
+        resources:
+          requests:
+            cpu: "250m"       # Guaranteed 0.25 vCPU cores
+            memory: "512Mi"   # Guaranteed 512 Megabytes Memory
+          limits:
+            cpu: "1000m"      # Maximum 1 vCPU
+            memory: "1.5Gi"   # Maximum 1.5 Gigabytes Memory
+            
+        # Keep Kubernetes aware of container health (assuming your app stays up as long as Python runs)
+        # We can simulate liveness since it's an infinite loop process with no HTTP server
+        # Alternately you can add a health endpoint / file touch later.

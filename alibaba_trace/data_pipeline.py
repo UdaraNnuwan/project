@@ -83,6 +83,15 @@ META_COLS: List[str] = [
 # Timestamp column (used only for ordering; not fed to the model)
 TIME_COL: str = "time_stamp"
 
+# Official 11 columns of Alibaba Cluster Trace V2018 (container_usage.csv)
+# We map indices 5 and 6 to cpu_request/mem_request for backward compatibility
+ALIBABA_V2018_COLS = [
+    "container_id", "machine_id", "time_stamp",
+    "cpu_util_percent", "mem_util_percent",
+    "cpu_request", "mem_request", "unknown_metrics",
+    "net_in", "net_out", "disk_io_percent"
+]
+
 # Number of time steps in one sliding window fed to the LSTM
 WINDOW_SIZE: int = 50
 
@@ -91,7 +100,7 @@ STRIDE: int = 10
 
 # How many rows pandas loads per chunk from the CSV stream.
 # Keep this small (< 10 000) to limit peak RAM usage.
-CHUNK_SIZE: int = 5_000
+CHUNK_SIZE: int = 5000
 
 # ---------------------------------------------------------------------------
 # ─── PUBLIC API: count_csv_rows_in_tar_gz ───────────────────────────────────
@@ -296,7 +305,8 @@ class StreamingMinMaxScaler:
             for chunk in pd.read_csv(
                 fobj,
                 chunksize=CHUNK_SIZE,
-                usecols=lambda c: c in self.feature_cols,
+                names=ALIBABA_V2018_COLS,
+                header=None,
                 low_memory=True,
             ):
                 if chunks_seen >= max_chunks:
@@ -304,7 +314,8 @@ class StreamingMinMaxScaler:
 
                 chunk.dropna(how="all", inplace=True)
                 chunk.ffill(inplace=True)
-                chunk.fillna(0.0, inplace=True)
+                fill_dict = {c: 0.0 for c in self.feature_cols if c in chunk.columns}
+                chunk.fillna(value=fill_dict, inplace=True)
 
                 # Re-order columns to match FEATURE_COLS (some may be absent)
                 arr = chunk.reindex(columns=self.feature_cols, fill_value=0.0).values.astype(np.float64)
@@ -413,6 +424,7 @@ class AlibabaTraceDataset(IterableDataset):
         train_ratio: float = 0.70,
         total_rows: Optional[int] = None,
         include_next_step: bool = False,
+        max_chunks: Optional[int] = None,
     ) -> None:
         """
         Parameters
@@ -443,6 +455,7 @@ class AlibabaTraceDataset(IterableDataset):
         self.split             = split
         self.train_ratio       = train_ratio
         self.include_next_step = include_next_step
+        self.max_chunks        = max_chunks
 
         # ── Compute the exact training row limit ──────────────────────────
         # When total_rows is known: training_row_limit = floor(N * train_ratio)
@@ -509,6 +522,7 @@ class AlibabaTraceDataset(IterableDataset):
         meta_buffer: List[np.ndarray] = []
 
         chunk_idx  = 0  # Global chunk counter (for worker sharding + split logic)
+        processed_chunks = 0
         row_cursor = 0  # Running total of rows consumed so far (all workers combined)
 
         # ── Legacy SENTINEL (only used when total_rows was not provided) ──────
@@ -526,10 +540,15 @@ class AlibabaTraceDataset(IterableDataset):
             for chunk in pd.read_csv(
                 fobj,
                 chunksize=self.chunk_size,
+                names=ALIBABA_V2018_COLS,
+                header=None,
                 low_memory=True,
-                usecols=lambda c: c in all_cols,
                 na_values=["", "NA", "N/A", "nan", "NaN", "null", "NULL", "-1"],
             ):
+                if self.max_chunks is not None and processed_chunks >= self.max_chunks:
+                    logger.info(f"Reached configured limit of {self.max_chunks} chunks. Stopping iteration early.")
+                    break
+                    
                 n_rows = len(chunk)
 
                 # ── Worker sharding: each worker processes only its own chunks ─
@@ -567,10 +586,21 @@ class AlibabaTraceDataset(IterableDataset):
                     row_cursor += n_rows
                     continue
 
+                # Once we reach here, the chunk is successfully claimed by this split.
+                processed_chunks += 1
+
                 # ── NaN handling ──────────────────────────────────────────
                 chunk.ffill(inplace=True)
                 chunk.bfill(inplace=True)
-                chunk.fillna(0.0, inplace=True)
+                
+                fill_dict_ds = {c: 0.0 for c in self.feature_cols if c in chunk.columns}
+                for mc in self.meta_cols:
+                    if mc in chunk.columns:
+                        fill_dict_ds[mc] = "missing"
+                chunk.fillna(value=fill_dict_ds, inplace=True)
+                
+                print(f"[Worker {worker_id}] Processing Chunk Round {chunk_idx + 1}: rows {row_cursor} to {row_cursor + n_rows} (split={self.split})")
+                import sys; sys.stdout.flush()
 
                 # ── Feature extraction ────────────────────────────────────
                 ts_arr = chunk.reindex(
@@ -656,6 +686,7 @@ def build_dataloader(
     num_workers: int = 0,
     pin_memory: bool = False,
     include_next_step: bool = False,
+    max_chunks: Optional[int] = None,
 ) -> DataLoader:
     """
     Build a ``torch.utils.data.DataLoader`` that streams sliding windows from
@@ -715,6 +746,7 @@ def build_dataloader(
         train_ratio=train_ratio,
         total_rows=total_rows,
         include_next_step=include_next_step,
+        max_chunks=max_chunks,
     )
 
     loader = DataLoader(
