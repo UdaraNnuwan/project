@@ -130,23 +130,30 @@ _YELLOW = "\033[93m"
 _RESET  = "\033[0m"
 
 
-def terminal_log(key, cpu, mem, net, all_score, top_score, all_status, top_status, warmup_info=None):
+def terminal_log(
+    key, cpu, mem, net,
+    all_score, all_threshold,
+    top_score, top_threshold,
+    all_status, top_status,
+    warmup_info=None,
+):
     """Emit a single colored status line to stdout."""
-    ts   = datetime.now().strftime("%H:%M:%S")
+    ts    = datetime.now().strftime("%H:%M:%S")
     ns, pod, container = key
     label = f"{ns}/{pod}/{container}"
 
     if warmup_info:
-        tag   = f"{_YELLOW}⏳ WARMUP {warmup_info}{_RESET}"
+        tag = f"{_YELLOW}⏳ WARMUP {warmup_info}{_RESET}"
     elif "ANOMALY" in all_status or "ANOMALY" in top_status:
-        tag   = f"{_RED}🔴 ANOMALY{_RESET}"
+        tag = f"{_RED}🔴 ANOMALY{_RESET}"
     else:
-        tag   = f"{_GREEN}🟢 NORMAL {_RESET}"
+        tag = f"{_GREEN}🟢 NORMAL {_RESET}"
 
     line = (
         f"[{ts}] {tag} {label:<60} "
         f"| CPU={cpu:>8.4f} MEM={mem:>10.0f} NET={net:>10.0f} "
-        f"ALL={all_score:.6f} TOP={top_score:.6f}"
+        f"ALL={all_score:.6f}(thr={all_threshold:.6f}) "
+        f"TOP={top_score:.6f}(thr={top_threshold:.6f})"
     )
     sys.stdout.write(line + "\n")
     sys.stdout.flush()
@@ -601,7 +608,12 @@ def log_dual_status_block(
     cpu = float(row["cpu_util"]) if row is not None else 0.0
     mem = float(row["mem_util"]) if row is not None else 0.0
     net = float(row["net_in"])   if row is not None else 0.0
-    terminal_log(key, cpu, mem, net, all_score, top_score, all_status, top_status)
+    terminal_log(
+        key, cpu, mem, net,
+        all_score, all_threshold,
+        top_score, top_threshold,
+        all_status, top_status,
+    )
 
     # Structured detail to file log only
     LOGGER.info(
@@ -723,7 +735,9 @@ def main():
                         mem=float(row["mem_util"]),
                         net=float(row["net_in"]),
                         all_score=all_score,
+                        all_threshold=all_threshold,
                         top_score=top_score,
+                        top_threshold=top_threshold,
                         all_status="NORMAL",
                         top_status="NORMAL",
                         warmup_info=warmup_info,
