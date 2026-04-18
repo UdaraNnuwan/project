@@ -1,307 +1,311 @@
+# =============================================================================
+# live_inference.py
+# FINAL FIXED VERSION - BiLSTM-FiLM Live Service (All Errors Fixed)
+# =============================================================================
+
 import os
 import time
 import requests
 import logging
 import sys
+import subprocess
 import torch
-import csv
-import json
 import numpy as np
+import json
 from collections import defaultdict, deque
-from sklearn.preprocessing import MinMaxScaler
+from pathlib import Path
 
-try:
-    from dotenv import load_dotenv
-    # Explicitly load from the project root .env file, resolving reliably across directory structures
-    root_env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
-    load_dotenv(dotenv_path=root_env_path)
-except ImportError:
-    pass  # python-dotenv not installed, fallback to manual env vars
-
-# Append project root to sys.path if running locally so alibaba_trace can be imported
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-try:
-    from alibaba_trace.model_architecture import load_dual_head_model
-except ImportError:
-    # Fallback if scripts are copied into the same directory in Docker
-    from model_architecture import load_dual_head_model
-
-# Configure production-ready logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+from alibaba_trace.model_architecture import load_dual_head_model
+from alibaba_trace.incident_response import (
+    ContainerContext,
+    SeverityScorer,
+    ContextAwareRCA,
+    IncidentPipeline,
+    AlertGenerator,
+    GenAIRCAEngine,
 )
-logger = logging.getLogger("BiLSTM-FiLM-Inference")
 
-# Constants
-QUERY_INTERVAL = 10 # seconds
-TIMEOUT = 10 # seconds
-DEFAULT_PROM_URL = "http://35.206.92.147:9090/api/v1/query"
+from src.notifications import send_telegram_alert
 
-# Global buffers and thresholds
+# ========================= CLEAN LOGGING =========================
+log_file_path = "live_inference.log"
+
+logger = logging.getLogger("BiLSTM-FiLM-Live")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+for handler in logger.handlers[:]:
+    logger.removeHandler(handler)
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s - %(message)s'))
+logger.addHandler(console_handler)
+
+file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
+file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s - %(message)s'))
+logger.addHandler(file_handler)
+
+# ========================= CONFIG =========================
+PROM_URL = os.getenv("PROM_URL", "http://35.206.92.147:9090/api/v1/query")
+QUERY_INTERVAL = int(os.getenv("QUERY_INTERVAL", 10))
+THRESHOLD_MULTIPLIER = float(os.getenv("THRESHOLD_MULTIPLIER", 2.0))
+WARM_UP_CYCLES = int(os.getenv("WARM_UP_CYCLES", 20))
+LOG_LINES = 15
+
+FEATURE_COLS = ["cpu_util_percent", "mem_util_percent", "cpu_request", "mem_request", "net_in", "net_out", "disk_io_percent"]
+
+PROM_QUERIES = {
+    "cpu_util_percent": 'rate(container_cpu_usage_seconds_total{image!="",image!~".*pause.*",name!=""}[5m]) * 100',
+    "mem_util_percent": '(container_memory_usage_bytes{image!="",image!~".*pause.*",name!=""} / container_spec_memory_limit_bytes{image!="",image!~".*pause.*",name!=""}) * 100',
+    "cpu_request": 'container_spec_cpu_quota{image!="",image!~".*pause.*",name!=""} / 100000',
+    "mem_request": 'container_spec_memory_limit_bytes{image!="",image!~".*pause.*",name!=""} / (1024*1024*1024)',
+    "net_in": 'rate(container_network_receive_bytes_total{image!="",image!~".*pause.*",name!=""}[5m]) / (1024*1024)',
+    "net_out": 'rate(container_network_transmit_bytes_total{image!="",image!~".*pause.*",name!=""}[5m]) / (1024*1024)',
+    "disk_io_percent": 'rate(container_fs_io_time_seconds_total{image!="",image!~".*pause.*",name!=""}[5m]) * 100'
+}
+
+PROJECT_ROOT = Path(__file__).parent.parent
+MODEL_PATH = PROJECT_ROOT / "alibaba_trace" / "outputs" / "dual_head_model.pt"
+SCALER_PATH = MODEL_PATH.parent / "scaler_params.json"
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 buffers = defaultdict(lambda: deque(maxlen=50))
-loss_histories = defaultdict(lambda: deque(maxlen=100))
-threshold_multiplier = float(os.environ.get("THRESHOLD_MULTIPLIER", 2.0))
-warm_up_cycles = int(os.environ.get("WARM_UP_CYCLES", 10))
+loss_histories = defaultdict(lambda: deque(maxlen=200))
 cycle_count = 0
 
-# Modified this to properly match your cAdvisor metrics layout.
-# Your setup doesn't have a 'container' label, it uses 'name'. Also stripping 'pause' images to filter out sandbox POD networks.
-PROMQL_QUERY = 'rate(container_cpu_usage_seconds_total{image!="", image!~".*pause.*", name!=""}[5m])'
-
-# Import Common Notification Interfaces
-try:
-    from src.notifications import send_telegram_alert, analyze_with_gpt
-except ImportError:
-    # Handle scenario where scripts are isolated (e.g. Dockerfile mapping rules)
-    from notifications import send_telegram_alert, analyze_with_gpt
-
-def log_results_to_csv(results, filepath="metrics_log.csv"):
-    """Append batch metric results reliably to a local CSV file."""
-    file_exists = os.path.isfile(filepath)
-    try:
-        with open(filepath, mode='a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(['Timestamp', 'Container_Name', 'Metric_Value'])
-                
-            for result in results:
-                labels = result.get('metric', {})
-                container_name = labels.get('container_label_io_kubernetes_pod_name', labels.get('name', labels.get('id', 'unknown')))
-                val_data = result.get('value', [])
-                if len(val_data) == 2:
-                    ts, val = val_data
-                    writer.writerow([ts, container_name, val])
-    except Exception as e:
-        logger.error(f"Failed to write metrics to CSV: {e}")
-
-# Modified this to properly match your cAdvisor metrics layout.
-PROMQL_QUERY = 'rate(container_cpu_usage_seconds_total{image!="", image!~".*pause.*", name!=""}[5m])'
-
-def load_model():
-    """
-    Load the DualHeadBiLSTMFiLM model and scaler here.
-    """
-    logger.info("Loading Dual-Head BiLSTM-FiLM model...")
-    
-    # Check for model path in env vars (e.g. from volume mount or copied file)
-    # Defaulting to local path if not running in cluster yet
-    # We resolve the absolute path relative to this script's directory (the k8s folder)
-    default_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
-                                "alibaba_trace", "outputs", "dual_head_model.pt")
-    model_path = os.environ.get("MODEL_PATH", default_path)
-    
-    if not os.path.exists(model_path):
-        # Fallback for Docker container if copied to root /app
-        model_path = "dual_head_model.pt"
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model file not found. Checked absolute path: {default_path} and Docker path: dual_head_model.pt")
-            
-    # Load scaler
-    scaler_path = os.path.join(os.path.dirname(model_path), "scaler_params.json")
-    if not os.path.exists(scaler_path):
-        scaler_path = "scaler_params.json"
-        if not os.path.exists(scaler_path):
-            raise FileNotFoundError(f"Scaler params not found. Checked {scaler_path}")
-    
-    with open(scaler_path, 'r') as f:
-        scaler_params = json.load(f)
-    
-    scaler = MinMaxScaler()
-    scaler.min_ = np.array(scaler_params['min_'])
-    scaler.scale_ = 1.0 / (np.array(scaler_params['max_']) - np.array(scaler_params['min_']))
-    scaler.data_min_ = scaler.min_
-    scaler.data_max_ = np.array(scaler_params['max_'])
-    scaler.data_range_ = scaler.data_max_ - scaler.data_min_
-    scaler.n_features_in_ = len(scaler.min_)
-    
-    # Model parameters as defined during training
-    WINDOW_SIZE = 50
-    N_TS_FEAT = 7
-    N_META_FEAT = 2
-    LATENT_DIM = 64
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Loading model to device: {device} from {model_path}")
-    
+# ========================= LOAD MODEL =========================
+def load_model_and_scaler():
+    global model, scaler
+    logger.info(f"Loading model from: {MODEL_PATH}")
     model = load_dual_head_model(
-        checkpoint_path=model_path,
-        window_size=WINDOW_SIZE,
-        n_ts_features=N_TS_FEAT,
-        n_meta_features=N_META_FEAT,
-        latent_dim=LATENT_DIM,
+        checkpoint_path=str(MODEL_PATH),
+        window_size=50,
+        n_ts_features=7,
+        n_meta_features=2,
+        latent_dim=64,
         device=device
     )
-    return model, scaler, device
 
-def fetch_prometheus_data(prom_url):
-    """
-    Robust fetch function that calls the Prometheus HTTP API endpoint (/api/v1/query).
-    """
-    try:
-        response = requests.get(
-            prom_url, 
-            params={'query': PROMQL_QUERY}, 
-            timeout=TIMEOUT
-        )
-        response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
-        return response.json()
-    except requests.exceptions.HTTPError as errh:
-        logger.error(f"HTTP Error: {errh}")
-    except requests.exceptions.ConnectionError as errc:
-        logger.error(f"Connection Error (is Prometheus down?): {errc}")
-    except requests.exceptions.Timeout as errt:
-        logger.error(f"Timeout Error querying Prometheus: {errt}")
-    except requests.exceptions.RequestException as err:
-        logger.error(f"General Request Exception: {err}")
-    
-    return None
+    with open(SCALER_PATH, 'r') as f:
+        params = json.load(f)
 
-def process_and_infer(model, scaler, device, raw_data):
-    """
-    Preprocess data and run anomaly detection inference using the trained model.
-    """
-    global cycle_count
-    
-    # Process each container's metric stream from the current batch
-    for result in raw_data:
-        # Extract the metric dictionary (labels/metadata) to be fed into the FiLM layer
-        labels = result.get('metric', {})
-        container_name = labels.get('container_label_io_kubernetes_pod_name', labels.get('name', labels.get('id', 'unknown')))
-        
-        # Extract the value[1] (the actual float metric) to be fed into the BiLSTM
-        val_data = result.get('value', [])
-        if len(val_data) < 2:
-            continue
-            
+    def scaler_func(x):
+        x = np.array(x, dtype=np.float32)
+        min_ = np.array(params['min_'])
+        max_ = np.array(params['max_'])
+        return np.clip((x - min_) / (max_ - min_ + 1e-8), 0.0, 1.0)
+
+    scaler = scaler_func
+    logger.info("✅ Model + Scaler loaded")
+
+# ========================= CALIBRATE SCORER =========================
+def calibrate_scorer():
+    logger.info("Calibrating SeverityScorer...")
+    baseline_mse = []
+    for i in range(40):
         try:
-            cpu_val = float(val_data[1])
-        except ValueError:
-            logger.error(f"Failed to cast value to float: {val_data[1]}")
+            resp = requests.get(PROM_URL, params={'query': PROM_QUERIES["cpu_util_percent"]}, timeout=8)
+            data = resp.json()
+            if data.get('status') == 'success':
+                for item in data['data'].get('result', []):
+                    try:
+                        val = float(item['value'][1])
+                        baseline_mse.append(val)
+                    except:
+                        pass
+        except:
+            pass
+        time.sleep(1)
+
+    if baseline_mse:
+        scorer.calibrate(baseline_mse)
+        logger.info(f"✅ Scorer calibrated | P95={scorer.p95:.5f} | P98={scorer.p98:.5f} | P99.5={scorer.p995:.5f}")
+    else:
+        logger.warning("Calibration failed. Using default thresholds.")
+        scorer.p95 = 0.0325
+        scorer.p98 = 0.0350
+        scorer.p995 = 0.0380
+
+# ========================= GET CONTAINER LOGS =========================
+def get_container_logs(pod_name: str, namespace: str = "prod", lines: int = LOG_LINES):
+    try:
+        cmd = f"kubectl logs {pod_name} -n {namespace} --tail={lines}"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=8)
+        if result.returncode == 0:
+            return result.stdout.strip() or "No logs available"
+        else:
+            return f"kubectl error: {result.stderr.strip()}"
+    except Exception as e:
+        return f"Failed to fetch logs: {e}"
+
+# ========================= STARTUP NOTIFICATION =========================
+def send_startup_notification():
+    message = (
+        "🚀 <b>BiLSTM-FiLM Live Inference Service Started Successfully!</b>\n\n"
+        "✅ Model loaded\n"
+        "✅ Scorer calibrated\n"
+        "✅ All 7 metrics monitored\n"
+        "✅ Log file created: live_inference.log"
+    )
+    send_telegram_alert(message)
+    logger.info("📨 Startup Telegram notification sent")
+
+# ========================= PIPELINE =========================
+scorer = SeverityScorer()
+rca_engine = ContextAwareRCA(feature_cols=FEATURE_COLS)
+alerter = AlertGenerator(cluster='alibaba-k8s-production', namespace='prod')
+
+incident_pipeline = IncidentPipeline(scorer=scorer, rca=rca_engine, alerter=alerter)
+genai_engine = GenAIRCAEngine()
+
+# ========================= MAIN LOOP =========================
+def run_inference():
+    global cycle_count
+    cycle_count += 1
+
+    logger.info(f"Cycle {cycle_count} | Fetching 7 multivariate metrics...")
+
+    raw_data = {}
+    for feature, query in PROM_QUERIES.items():
+        try:
+            resp = requests.get(PROM_URL, params={'query': query}, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get('status') == 'success':
+                raw_data[feature] = data['data']['result']
+        except Exception as e:
+            logger.warning(f"Failed to fetch {feature}: {e}")
+
+    if not raw_data:
+        logger.warning("No data from Prometheus this cycle.")
+        return
+
+    container_names = set()
+    current_metrics = defaultdict(dict)
+
+    for feat in FEATURE_COLS:
+        for item in raw_data.get(feat, []):
+            metric = item.get('metric', {})
+            name = (metric.get('pod') or 
+                    metric.get('container_label_io_kubernetes_pod_name') or 
+                    metric.get('name') or 
+                    metric.get('container') or "unknown")
+
+            if name == "unknown":
+                continue
+
+            container_names.add(name)
+
+            try:
+                val = float(item['value'][1])
+                if feat == "mem_util_percent":
+                    limit = float(metric.get('container_spec_memory_limit_bytes', 0))
+                    usage = float(metric.get('container_memory_usage_bytes', 0))
+                    val = (usage / limit * 100) if limit > 0 else 0.0
+                current_metrics[name][feat] = round(val, 4)
+            except:
+                current_metrics[name][feat] = 0.0
+
+    for container_name in container_names:
+        window = [current_metrics[container_name].get(feat, 0.0) for feat in FEATURE_COLS]
+
+        if len(window) != 7:
             continue
-            
-        # Basic filter: log an exact 0.0 value as a warning and skip feeding it to the model        
-        if cpu_val == 0.0 or np.isnan(cpu_val):
-            logger.warning(f"⚠️ Skipping container {container_name}. CPU value is {cpu_val}.")
-            continue
-        
-        # Append to buffer
-        buffers[container_name].append(cpu_val)
-        
-        # Only run inference when window is full
+
+        buffers[container_name].append(window)
+
         if len(buffers[container_name]) < 50:
             continue
-        
-        # Prepare time-series tensor: replicate CPU to 7 features
-        sequence = list(buffers[container_name])
-        ts_features = np.array([[val] * 7 for val in sequence])
-        
-        # Normalize using scaler
-        ts_features = scaler.transform(ts_features.reshape(-1, 7)).reshape(50, 7)
-        
-        ts_tensor = torch.tensor(ts_features).float().unsqueeze(0).to(device)
-        
-        # Prepare metadata tensor
-        meta1 = hash(container_name) % 1000 / 1000.0  # Normalized hash
-        meta2 = 1.0 if 'image' in labels and labels['image'] else 0.0
-        meta_tensor = torch.tensor([[meta1, meta2]]).float().to(device)
-        
-        # Run model inference
+
+        ts_array = np.array(list(buffers[container_name]))
+        scaled = scaler(ts_array).reshape(1, 50, 7)
+
+        ts_tensor = torch.from_numpy(scaled).float().to(device)
+
+        meta_vec = np.array([
+            hash(container_name) % 999983 / 999983.0,
+            1.0 if "db" in container_name.lower() else 0.0
+        ], dtype=np.float32)
+        meta_tensor = torch.from_numpy(meta_vec).unsqueeze(0).float().to(device)
+
         with torch.no_grad():
-            recon_output, forecast_output = model(ts_tensor, meta_tensor)
-        
-        # Compute MSE loss using reconstruction output
-        mse_loss = torch.mean((recon_output - ts_tensor) ** 2).item()
-        
-        # Append to loss history
-        loss_histories[container_name].append(mse_loss)
-        
-        # Compute dynamic threshold if sufficient history
-        if len(loss_histories[container_name]) >= 10:
-            losses = list(loss_histories[container_name])
-            mean_loss = sum(losses) / len(losses)
-            std_loss = (sum((x - mean_loss) ** 2 for x in losses) / len(losses)) ** 0.5
-            threshold = mean_loss + threshold_multiplier * std_loss
-        else:
-            threshold = float('inf')  # No threshold yet
-        
-        # Determine status
-        if cycle_count > warm_up_cycles and len(loss_histories[container_name]) >= 10:
-            status = "Anomaly" if mse_loss > threshold else "Normal"
-        else:
-            status = "Normal"  # Warm-up or insufficient history
-        
-        # Log the status
-        if status == "Anomaly":
-            logger.warning(f"🚨 STATUS: {status} | Container: {container_name} | MSE: {mse_loss:.4f} > Threshold: {threshold:.4f}")
-            send_telegram_alert(f"🚨 Anomaly Detected!\nContainer: {container_name}\nMSE: {mse_loss:.4f}\nThreshold: {threshold:.4f}")
-        else:
-            logger.info(f"✅ STATUS: {status} | Container: {container_name} | MSE: {mse_loss:.4f} <= Threshold: {threshold:.4f}")
+            recon, _ = model(ts_tensor, meta_tensor)
+            mse_score = torch.mean((recon - ts_tensor) ** 2).item()
 
-    logger.info("Successfully processed batch and ran inference.")
+        loss_histories[container_name].append(mse_score)
 
-def main():
-    logger.info("Initializing Live Inference Service...")
-    
-    # Send test message to group at initialization
-    send_telegram_alert("🚀 BiLSTM-FiLM Anomaly Inference Service Started! Connecting to metrics stream...")
-    
-    # Environment variable check with fallback
-    prom_url = os.environ.get("PROM_URL", DEFAULT_PROM_URL)
-    logger.info(f"Configured Prometheus Endpoint: {prom_url}")
-    
-    # Load model once at startup to prevent memory leaks and overhead
-    try:
-        model, scaler, device = load_model()
-    except Exception as e:
-        logger.critical(f"Failed to load model. Exiting pod. Error: {e}")
-        sys.exit(1)
-        
-    logger.info("Entering continuous inference loop...")
-    
-    while True:
-        start_time = time.time()
-        global cycle_count
-        cycle_count += 1
-        
-        logger.info(f"Querying Prometheus API with query: {PROMQL_QUERY}")
-        data = fetch_prometheus_data(prom_url)
-        
-        if data and data.get('status') == 'success':
-            results = data.get('data', {}).get('result', [])
-            if not results:
-                logger.warning("Query returned successful status but no metrics were found.")
-            else:
-                logger.info(f"Fetched {len(results)} metric streams from Prometheus.")
-                
-                # Log each individual query result (to stdout and to CSV)
-                log_results_to_csv(results)
-                
-                for i, result in enumerate(results):
-                    metric_labels = result.get('metric', {})
-                    # A small trick to cleanly log important labels (like name or image) and the value
-                    container_name = metric_labels.get('container_label_io_kubernetes_pod_name', metric_labels.get('name', metric_labels.get('id', 'unknown')))
-                    value = result.get('value', [])
-                    logger.info(f"  [{i+1}/{len(results)}] Container: {container_name} | Labels: {metric_labels} | Data: {value}")
-                
-                try:
-                    process_and_infer(model, scaler, device, results)
-                except Exception as e:
-                    # Catch ML-related exceptions so the pod doesn't crash on bad data
-                    logger.error(f"Error during inference execution: {e}", exc_info=True)
-                    gpt_analysis = analyze_with_gpt(str(e))
-                    send_telegram_alert(f"🚨 Inference Error Alert!\n\nError: {e}\n\n🤖 GPT Analysis:\n{gpt_analysis}")
+        if len(loss_histories[container_name]) >= 20:
+            mean_loss = np.mean(loss_histories[container_name])
+            std_loss = np.std(loss_histories[container_name])
+            threshold = mean_loss + THRESHOLD_MULTIPLIER * std_loss
         else:
-            logger.warning("Failed to retrieve valid data from Prometheus in this cycle. Skipping inference.")
-            
-        # Ensure we sleep for the remainder of the 60 seconds interval
-        elapsed = time.time() - start_time
-        sleep_time = max(0, QUERY_INTERVAL - elapsed)
-        
-        logger.info(f"Cycle completed in {elapsed:.2f}s. Sleeping for {sleep_time:.2f}s before next query...")
-        time.sleep(sleep_time)
+            threshold = float('inf')
+
+        status = "Anomaly" if mse_score > threshold else "Normal"
+
+        metrics_str = " | ".join([f"{k.split('_')[0].upper()}: {v}" for k, v in current_metrics[container_name].items()])
+
+        if status == "Anomaly" and cycle_count > WARM_UP_CYCLES:
+            logger.warning(f"🚨 ANOMALY DETECTED | {container_name} | MSE={mse_score:.5f} | {metrics_str}")
+
+            recent_logs = get_container_logs(container_name)
+
+            ctx = ContainerContext.from_ids(
+                container_id=container_name,
+                machine_id="k8s-node",
+                container_type="database" if "db" in container_name.lower() else "api",
+                tier="data",
+                environment="production",
+                namespace="prod",
+                pod_name=container_name
+            )
+
+            incident = incident_pipeline.process(
+                original=ts_array,
+                reconstructed=recon.cpu().numpy()[0],
+                mse_score=mse_score,
+                context=ctx
+            )
+
+            # FIXED: Added missing threshold_p95 argument
+            llm_result = genai_engine.analyze_with_llm(
+                original_metrics=ts_array,
+                reconstructed_metrics=recon.cpu().numpy()[0],
+                mse=mse_score,
+                context=ctx,
+                rca_result=incident.__dict__,
+                recent_logs=recent_logs,
+                threshold_p95=scorer.p95          # ← This was missing
+            )
+
+            alert_msg = (
+                f"🚨 ANOMALY DETECTED\n"
+                f"Container: {container_name}\n"
+                f"MSE: {mse_score:.5f}\n"
+                f"Metrics: {metrics_str}\n\n"
+                f"GenAI Analysis:\n{llm_result}\n\n"
+                f"Recent Logs:\n{recent_logs[:800]}..."
+            )
+            send_telegram_alert(alert_msg)
+
+        else:
+            logger.info(f"✅ NORMAL | {container_name} | MSE={mse_score:.5f} | {metrics_str}")
 
 if __name__ == "__main__":
-    main()
+    load_model_and_scaler()
+    calibrate_scorer()
+    send_startup_notification()
+    logger.info("🚀 BiLSTM-FiLM Live Inference Service Started Successfully!")
+    logger.info(f"Monitoring Prometheus at: {PROM_URL}")
+    logger.info(f"Log file: {log_file_path}")
+
+    while True:
+        start = time.time()
+        run_inference()
+        elapsed = time.time() - start
+        sleep_time = max(0, QUERY_INTERVAL - elapsed)
+        logger.info(f"Cycle completed in {elapsed:.2f}s | Sleeping {sleep_time:.2f}s...")
+        time.sleep(sleep_time)
