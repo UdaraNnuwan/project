@@ -16,6 +16,7 @@ env/
 
 # Model outputs & large data
 alibaba_trace/outputs/
+!alibaba_trace/outputs/scaler_params.json
 *.pt
 *.pth
 *.joblib
