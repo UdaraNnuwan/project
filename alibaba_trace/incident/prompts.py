@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Tuple
 
 # Centralised LLM Prompt Template
 PROMPT_TEMPLATE = """\

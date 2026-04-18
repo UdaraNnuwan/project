@@ -30,9 +30,7 @@ from alibaba_trace.data.dataset import _encode_metadata, META_COLS
 import json
 from dotenv import load_dotenv
 load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
-from alibaba_trace.incident.pipeline import IncidentPipeline, SynchronousAlertDispatcher
-from alibaba_trace.incident.rca_genai import GenAIRCAEngine
-from alibaba_trace.incident.models import ContainerContext
+
 
 # ── Notification / AI helpers (imported once at module level) ──────────────
 from alibaba_trace.utils.notifications import send_telegram_alert
@@ -639,12 +637,7 @@ def main():
     except Exception as e:
         LOGGER.error(f"Startup Telegram message failed: {e}")
 
-    try:
-        from alibaba_trace.utils.ai_helper import get_configured_engine
-        engine = get_configured_engine(temperature=0.1)
-        LOGGER.info(f"OpenAI test initialized: {engine}")
-    except Exception as e:
-        LOGGER.error(f"OpenAI test initialization failed: {e}")
+
 
     with open(X_SCALER_PATH, 'r') as f:
         scaler_data = json.load(f)
