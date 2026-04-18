@@ -34,6 +34,10 @@ from alibaba_trace.incident.pipeline import IncidentPipeline, SynchronousAlertDi
 from alibaba_trace.incident.rca_genai import GenAIRCAEngine
 from alibaba_trace.incident.models import ContainerContext
 
+# ── Notification / AI helpers (imported once at module level) ──────────────
+from alibaba_trace.utils.notifications import send_telegram_alert
+from alibaba_trace.utils.ai_helper import get_gpt_explanation
+
 
 # =========================================================
 # CONFIG
@@ -116,6 +120,36 @@ sh = logging.StreamHandler()
 sh.setLevel(logging.INFO)
 sh.setFormatter(formatter)
 LOGGER.addHandler(sh)
+
+# ---------------------------------------------------------
+# ANSI terminal colors (no external libs)
+# ---------------------------------------------------------
+_GREEN  = "\033[92m"
+_RED    = "\033[91m"
+_YELLOW = "\033[93m"
+_RESET  = "\033[0m"
+
+
+def terminal_log(key, cpu, mem, net, all_score, top_score, all_status, top_status, warmup_info=None):
+    """Emit a single colored status line to stdout."""
+    ts   = datetime.now().strftime("%H:%M:%S")
+    ns, pod, container = key
+    label = f"{ns}/{pod}/{container}"
+
+    if warmup_info:
+        tag   = f"{_YELLOW}⏳ WARMUP {warmup_info}{_RESET}"
+    elif "ANOMALY" in all_status or "ANOMALY" in top_status:
+        tag   = f"{_RED}🔴 ANOMALY{_RESET}"
+    else:
+        tag   = f"{_GREEN}🟢 NORMAL {_RESET}"
+
+    line = (
+        f"[{ts}] {tag} {label:<60} "
+        f"| CPU={cpu:>8.4f} MEM={mem:>10.0f} NET={net:>10.0f} "
+        f"ALL={all_score:.6f} TOP={top_score:.6f}"
+    )
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
 
 # =========================================================
 # PROMETHEUS QUERIES
@@ -561,22 +595,21 @@ def log_dual_status_block(
     top_features,
     reason,
     ranked,
+    row=None,
 ):
-    LOGGER.info("=" * 60)
-    LOGGER.info(f"TARGET            : {key}")
+    # Compact terminal line
+    cpu = float(row["cpu_util"]) if row is not None else 0.0
+    mem = float(row["mem_util"]) if row is not None else 0.0
+    net = float(row["net_in"])   if row is not None else 0.0
+    terminal_log(key, cpu, mem, net, all_score, top_score, all_status, top_status)
 
-    LOGGER.info(f"ALL_SCORE         : {all_score:.6f}")
-    LOGGER.info(f"ALL_THRESHOLD     : {all_threshold:.6f}")
-    LOGGER.info(f"ALL_STATUS        : {all_status}")
-
-    LOGGER.info(f"TOP_SCORE         : {top_score:.6f}")
-    LOGGER.info(f"TOP_THRESHOLD     : {top_threshold:.6f}")
-    LOGGER.info(f"TOP_FEATS         : {top_features}")
-    LOGGER.info(f"TOP_REASON        : {reason}")
-    LOGGER.info(f"TOP_STATUS        : {top_status}")
-
-    LOGGER.info(f"ALL_FEATURE_ERRORS: {format_all_feature_errors(ranked)}")
-    LOGGER.info("=" * 60)
+    # Structured detail to file log only
+    LOGGER.info(
+        "DUAL | %s | ALL=%s(%.6f/%.6f) TOP=%s(%.6f/%.6f) feats=%s reason=%s",
+        "/".join(key), all_status, all_score, all_threshold,
+        top_status, top_score, top_threshold,
+        top_features, reason,
+    )
 
 
 # =========================================================
@@ -586,8 +619,10 @@ def main():
     LOGGER.info("Loading model artifacts...")
 
     try:
-        from alibaba_trace.utils.notifications import send_telegram_alert
-        send_telegram_alert("🚀 *Live Inference Agent Started!*\n\nDual-Head Model loaded successfully.\nChecking OpenAI GenAI hook...")
+        send_telegram_alert(
+            "\U0001F680 Live Inference Agent Started!\n\nDual-Head Model loaded. Monitoring active.",
+            skip_dedup=True,   # always send the startup banner
+        )
         LOGGER.info("Startup Telegram message sent successfully.")
     except Exception as e:
         LOGGER.error(f"Startup Telegram message failed: {e}")
@@ -681,17 +716,18 @@ def main():
                 )
 
                 if state["inference_count"] <= WARMUP_WINDOWS:
-                    LOGGER.info("=" * 60)
-                    LOGGER.info(f"TARGET            : {key}")
-                    LOGGER.info(f"STATUS            : WARMUP ({state['inference_count']}/{WARMUP_WINDOWS})")
-                    LOGGER.info(f"ALL_SCORE         : {all_score:.6f}")
-                    LOGGER.info(f"ALL_THRESHOLD     : {all_threshold:.6f}")
-                    LOGGER.info(f"TOP_SCORE         : {top_score:.6f}")
-                    LOGGER.info(f"TOP_THRESHOLD     : {top_threshold:.6f}")
-                    LOGGER.info(f"TOP_FEATS         : {top_features}")
-                    LOGGER.info(f"TOP_REASON        : {reason}")
-                    LOGGER.info(f"ALL_FEATURE_ERRORS: {format_all_feature_errors(ranked)}")
-                    LOGGER.info("=" * 60)
+                    warmup_info = f"{state['inference_count']}/{WARMUP_WINDOWS}"
+                    terminal_log(
+                        key,
+                        cpu=float(row["cpu_util"]),
+                        mem=float(row["mem_util"]),
+                        net=float(row["net_in"]),
+                        all_score=all_score,
+                        top_score=top_score,
+                        all_status="NORMAL",
+                        top_status="NORMAL",
+                        warmup_info=warmup_info,
+                    )
                     continue
 
                 _, all_status, all_changed = update_status(
@@ -719,30 +755,59 @@ def main():
                 if all_changed == "STARTED" or top_changed == "STARTED":
                     all_status = "ANOMALY_STARTED" if all_changed == "STARTED" else all_status
                     top_status = "ANOMALY_STARTED" if top_changed == "STARTED" else top_status
-                    
-                    # Log Prometheus query data
-                    with open('prometheus_anomaly_query_data.log', 'a', encoding='utf-8') as f:
-                        f.write(str(window_df.iloc[-1].to_dict()) + '\n')
-                        f.flush()
-                        
-                    namespace, pod, container = key
+
+                    # Log raw Prometheus snapshot for post-mortem
                     try:
-                        from alibaba_trace.utils.notifications import send_telegram_alert
-                        from alibaba_trace.utils.ai_helper import get_gpt_explanation
-                        gpt_output = get_gpt_explanation(top_features, reason, {"all_score": all_score, "top_score": top_score})
-                        
-                        message = (
-                            f"🚨 *ANOMALY DETECTED*\n\n"
-                            f"Target: {namespace}/{pod}/{container}\n"
-                            f"All Score: {all_score:.6f}\n"
-                            f"Top Score: {top_score:.6f}\n"
-                            f"Top Features: {top_features}\n"
-                            f"Reason: {reason}\n"
-                            f"GPT Insight: {gpt_output}"
+                        with open('prometheus_anomaly_query_data.log', 'a', encoding='utf-8') as f:
+                            f.write(str(window_df.iloc[-1].to_dict()) + '\n')
+                            f.flush()
+                    except Exception as _log_err:
+                        LOGGER.warning("Failed to write anomaly snapshot log: %s", _log_err)
+
+                    namespace, pod, container = key
+                    entity_key = f"{namespace}/{pod}/{container}"
+
+                    # ── STEP 1: GPT Root Cause Analysis ──────────────────────
+                    gpt_insight = get_gpt_explanation(
+                        top_features=top_features,
+                        reason=reason,
+                        scores={"all_score": all_score, "top_score": top_score},
+                    )
+
+                    # ── STEP 2: Format alert message ──────────────────────────
+                    top_feat_errors = ", ".join(
+                        f"{k}={v:.6f}"
+                        for k, v in ranked[:len(top_features)]
+                    )
+                    triggered_by = []
+                    if all_changed == "STARTED":
+                        triggered_by.append("ALL")
+                    if top_changed == "STARTED":
+                        triggered_by.append("TOP")
+
+                    alert_message = (
+                        f"\U0001F6A8 ANOMALY DETECTED\n\n"
+                        f"Entity      : {entity_key}\n"
+                        f"Container   : {container}\n"
+                        f"Triggered by: {', '.join(triggered_by)} score\n\n"
+                        f"All Score   : {all_score:.6f}  (thr {all_threshold:.6f})\n"
+                        f"Top Score   : {top_score:.6f}  (thr {top_threshold:.6f})\n\n"
+                        f"Top features: {', '.join(top_features)}\n"
+                        f"Feature MSE : {top_feat_errors}\n\n"
+                        f"Reason      : {reason}\n"
+                        f"GPT Insight : {gpt_insight}"
+                    )
+
+                    # ── STEP 3: Send Telegram alert ───────────────────────────
+                    result = send_telegram_alert(
+                        message=alert_message,
+                        entity_key=entity_key,   # used for dedup fingerprint
+                    )
+                    if not result.get("success"):
+                        LOGGER.warning(
+                            "Telegram alert not delivered for %s: %s",
+                            entity_key, result.get("error"),
                         )
-                        send_telegram_alert(message)
-                    except Exception as e:
-                        LOGGER.error(f"Alert dispatch failed: {e}")
                 elif all_changed == "CLEARED":
                     all_status = "ANOMALY_CLEARED"
 
@@ -762,6 +827,7 @@ def main():
                     top_features=top_features,
                     reason=reason,
                     ranked=ranked,
+                    row=row,
                 )
 
             sys.stdout.write(f"Wait {POLL_INTERVAL_SECONDS}s ")
