@@ -62,7 +62,7 @@ def run_inference_and_log():
 
     anomaly_log = []
     
-    print("🚀 Running inference and determining Normal vs. Anomaly...")
+    print(" Running inference and determining Normal vs. Anomaly...")
     with torch.no_grad():
         for batch_idx, (x_batch, c_batch) in enumerate(test_loader):
             
@@ -92,8 +92,8 @@ def run_inference_and_log():
     output_path = Path("anomaly_predictions_log.csv")
     output_df.to_csv(output_path, index=False)
     
-    print(f"\\n✅ Inference complete! Logged {len(output_df)} windows.")
-    print(f"📁 Results saved to: {output_path.resolve()}")
+    print(f"\\n Inference complete! Logged {len(output_df)} windows.")
+    print(f" Results saved to: {output_path.resolve()}")
     
     # Preview top 10 results
     print("\\nPreview of Log:")

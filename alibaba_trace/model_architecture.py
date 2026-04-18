@@ -13,11 +13,11 @@ Architecture Overview
   │   Time Series     BiLSTM(H1)  ──── BN ──── Dropout                  │
   │   (B, W, F)  ──►  BiLSTM(H2)  ──── Dropout                          │
   │                   last-step → Linear(latent_dim) → encoding           │
-  │                                    ↕ FiLM(meta)                      │
+  │                                     FiLM(meta)                      │
   │   Metadata     ─►  γ, β ──► encoding * γ + β   (B, latent)          │
   │   (B, M)                                                              │
   └──────────────────────────────────────────────────────────────────────┘
-               ↙ conditioned latent (B, latent_dim) ↘
+                conditioned latent (B, latent_dim) 
 
   ┌─────────────────────────────┐   ┌───────────────────────────────────┐
   │    HEAD 1 — Reconstruction  │   │    HEAD 2 — Forecasting (t+1)     │
@@ -642,7 +642,7 @@ class DualHeadBiLSTMFiLM(nn.Module):
         Tensor flow summary
         -------------------
         ts   (B, W, F)  ──► BiLSTMEncoder ──► (B, latent)
-                                  ↕  FiLM(meta)
+                                    FiLM(meta)
                             (B, latent) ──┬──► BiLSTMDecoder ──► (B, W, F) [recon]
                                           └──► ForecastingHead ──► (B, F)  [t+1]
 

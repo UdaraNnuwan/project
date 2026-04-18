@@ -25,7 +25,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY k8s/live_inference.py .
 COPY alibaba_trace/model_architecture.py .
 COPY alibaba_trace/outputs/dual_head_model.pt .
-COPY src/notifications.py .
+COPY alibaba_trace/utils/notifications.py ./alibaba_trace/utils/
 
 # Ensure the script runs natively
 CMD ["python", "live_inference.py"]

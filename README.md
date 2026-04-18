@@ -67,6 +67,13 @@ python -m jupyter lab --notebook-dir=alibaba_trace
 | `04_Data_Injection_and_Accuracy_Testing` | Controlled FiLM context validation |
 | `05_GenAI_RCA_Integration` | Gemini/OpenAI root cause analysis |
 
+### 4. Test GPT Integration (Optional)
+If you have set up `OPENAI_API_KEY` or `GITHUB_TOKEN` in your `.env` file, test the GPT analysis:
+```bash
+python alibaba_trace/incident_response.py
+```
+This will run a sample GPT query and print the response.
+
 > **DEMO mode:** All notebooks work without the Alibaba archive.
 > Synthetic normal data is generated automatically.
 
@@ -86,5 +93,7 @@ python -m jupyter lab --notebook-dir=alibaba_trace
 TELEGRAM_BOT_TOKEN=your_token
 TELEGRAM_CHAT_ID=your_chat_id
 GEMINI_API_KEY=your_key
+GITHUB_TOKEN=your_github_token
 OPENAI_API_KEY=your_key
+OPENAI_MODEL=openai/gpt-4.1
 ```
