@@ -212,22 +212,22 @@ class AlibabaTraceDataset(IterableDataset):
                            else self.window_size)
 
                 while i + min_end <= buf_len:
-                    ts_win   = ts_full[i : i + self.window_size]        # (W, F)
-                    meta_vec = meta_full[i + self.window_size - 1]      # (M,)
+                    ts_win   = ts_full[i : i + self.window_size]                                                         # (W, F)
+                    meta_vec = meta_full[i + self.window_size - 1]                                                       # (M,)
 
                     if self.include_next_step:
-                        next_row = ts_full[i + self.window_size]        # (F,)
+                        next_row = ts_full[i + self.window_size]                                                         # (F,)
                         yield (
-                            torch.from_numpy(ts_win.copy()),    # ts_window (W,F)
-                            torch.from_numpy(meta_vec.copy()),  # meta_vec   (M,)
-                            torch.from_numpy(ts_win.copy()),    # recon tgt  (W,F)
-                            torch.from_numpy(next_row.copy()),  # fore tgt   (F,)
+                            torch.from_numpy(ts_win.copy()),                                                     # ts_window (W,F)
+                            torch.from_numpy(meta_vec.copy()),                                                   # meta_vec   (M,)
+                            torch.from_numpy(ts_win.copy()),                                                     # recon tgt  (W,F)
+                            torch.from_numpy(next_row.copy()),                                                   # fore tgt   (F,)
                         )
                     else:
                         yield (
-                            torch.from_numpy(ts_win.copy()),    # ts_window  (W,F)
-                            torch.from_numpy(meta_vec.copy()),  # meta_vec   (M,)
-                            torch.from_numpy(ts_win.copy()),    # target     (W,F)
+                            torch.from_numpy(ts_win.copy()),                                                     # ts_window  (W,F)
+                            torch.from_numpy(meta_vec.copy()),                                                   # meta_vec   (M,)
+                            torch.from_numpy(ts_win.copy()),                                                     # target     (W,F)
                         )
 
                     i += self.stride
