@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import logging
+import hashlib
 
 # Force real-time log flushing for production live environment
 if hasattr(sys.stdout, "reconfigure"):
@@ -51,6 +52,7 @@ AE_META_PATH = os.path.join(MODEL_DIR, "ae_model_meta.joblib")
 
 RAW_SNAPSHOT_CSV = os.path.join(CURRENT_DIR, "raw_snapshots.csv")
 LOG_FILE = os.path.join(CURRENT_DIR, "result_dual_status.log")
+IDENTIFIED_ANOMALY_LOG = os.path.join(CURRENT_DIR, "identified_anomalies.jsonl")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -529,6 +531,8 @@ def init_container_state():
 
         "all_score_history": deque(maxlen=ALL_SCORE_HISTORY_SIZE),
         "top_score_history": deque(maxlen=TOP_SCORE_HISTORY_SIZE),
+        "ignored_threshold_ids": set(),
+        "logged_anomaly_ids": set(),
 
         "inference_count": 0,
 
@@ -540,6 +544,19 @@ def init_container_state():
         "top_anomaly_hits": 0,
         "top_normal_hits": 0,
     }
+
+
+def format_warmup_info(inference_count, warmup_windows):
+    if inference_count <= 0:
+        return f"L0 0/{warmup_windows} (0%)"
+    pct = (float(inference_count) / float(max(warmup_windows, 1))) * 100.0
+    if pct < 34.0:
+        level = "L1"
+    elif pct < 67.0:
+        level = "L2"
+    else:
+        level = "L3"
+    return f"{level} {inference_count}/{warmup_windows} ({pct:.0f}%)"
 
 
 def compute_dynamic_threshold(score_history, base_threshold, multiplier, min_factor):
@@ -555,6 +572,58 @@ def compute_dynamic_threshold(score_history, base_threshold, multiplier, min_fac
 
 def format_all_feature_errors(ranked):
     return ", ".join([f"{k}={v:.6f}" for k, v in ranked])
+
+
+def format_prometheus_actual_values(row):
+    if row is None:
+        return "unavailable"
+
+    raw_values = {}
+    for col in FEATURE_COLS:
+        try:
+            raw_values[col] = float(row.get(col, 0.0))
+        except Exception:
+            raw_values[col] = 0.0
+
+    # Keep model-input mapping visible so Telegram shows exactly what model saw.
+    model_input_values = {
+        "cpu_util_percent": raw_values["cpu_util"],
+        "mem_util_percent": raw_values["mem_util"],
+        "cpu_request": raw_values["cpu_util"],   # dummy mapping used in inference
+        "mem_request": raw_values["mem_util"],   # dummy mapping used in inference
+        "net_in": raw_values["net_in"],
+        "net_out": raw_values["net_out"],
+        "disk_io_percent": raw_values["disk_read"] + raw_values["disk_write"],
+    }
+
+    raw_text = ", ".join([f"{k}={v:.6f}" for k, v in raw_values.items()])
+    model_text = ", ".join([f"{k}={v:.6f}" for k, v in model_input_values.items()])
+    ts_text = str(row.get("timestamp", ""))
+
+    return (
+        f"ts={ts_text}\n"
+        f"raw_metrics: {raw_text}\n"
+        f"model_input: {model_text}"
+    )
+
+
+def build_sample_id(key, row):
+    ts_text = str(row.get("timestamp", ""))
+    return f"{key[0]}/{key[1]}/{key[2]}|{ts_text}"
+
+
+def build_anomaly_id(sample_id):
+    digest = hashlib.md5(sample_id.encode("utf-8", errors="replace")).hexdigest()
+    return f"anom_{digest[:12]}"
+
+
+def append_identified_anomaly_log(payload):
+    try:
+        with open(IDENTIFIED_ANOMALY_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+            f.flush()
+    except Exception as e:
+        LOGGER.warning("Failed to write identified anomaly log: %s", e)
 
 
 def update_status(
@@ -686,6 +755,28 @@ def main():
                     state["window_buffer"].popleft()
 
                 if len(state["window_buffer"]) < window_size:
+                    buffer_info = (
+                        f"BUFFER {len(state['window_buffer'])}/{window_size} | "
+                        f"WARMUP {format_warmup_info(state['inference_count'], WARMUP_WINDOWS)}"
+                    )
+                    top_base_threshold = float(base_threshold) * (TOPK / len(FEATURE_COLS))
+                    terminal_log(
+                        key,
+                        cpu=float(row["cpu_util"]),
+                        mem=float(row["mem_util"]),
+                        net=float(row["net_in"]),
+                        all_score=0.0,
+                        all_threshold=float(base_threshold),
+                        top_score=0.0,
+                        top_threshold=float(top_base_threshold),
+                        all_status="NORMAL",
+                        top_status="NORMAL",
+                        warmup_info=buffer_info,
+                    )
+                    LOGGER.info(
+                        "WARMUP_BUFFER | %s | %s",
+                        "/".join(key), buffer_info,
+                    )
                     continue
 
                 ns_map, ct_map = build_label_maps(seen_keys)
@@ -698,11 +789,9 @@ def main():
                 )
 
                 reason = reason_from_top_features(top_features)
-
-                state["all_score_history"].append(all_score)
-                state["top_score_history"].append(top_score)
                 state["inference_count"] += 1
 
+                top_base_threshold = float(base_threshold) * (TOPK / len(FEATURE_COLS))
                 all_threshold = compute_dynamic_threshold(
                     state["all_score_history"],
                     base_threshold=base_threshold,
@@ -710,9 +799,6 @@ def main():
                     min_factor=ALL_MIN_THRESHOLD_FACTOR,
                 )
 
-                # top threshold derived from current top score history
-                # use base threshold scaled down to top-k proportion
-                top_base_threshold = float(base_threshold) * (TOPK / len(FEATURE_COLS))
                 top_threshold = compute_dynamic_threshold(
                     state["top_score_history"],
                     base_threshold=top_base_threshold,
@@ -721,7 +807,9 @@ def main():
                 )
 
                 if state["inference_count"] <= WARMUP_WINDOWS:
-                    warmup_info = f"{state['inference_count']}/{WARMUP_WINDOWS}"
+                    state["all_score_history"].append(all_score)
+                    state["top_score_history"].append(top_score)
+                    warmup_info = format_warmup_info(state["inference_count"], WARMUP_WINDOWS)
                     terminal_log(
                         key,
                         cpu=float(row["cpu_util"]),
@@ -735,9 +823,13 @@ def main():
                         top_status="NORMAL",
                         warmup_info=warmup_info,
                     )
+                    LOGGER.info(
+                        "WARMUP | %s | level=%s | ALL=%.6f TOP=%.6f",
+                        "/".join(key), warmup_info, all_score, top_score,
+                    )
                     continue
 
-                _, all_status, all_changed = update_status(
+                all_is_anomaly_now, all_status, all_changed = update_status(
                     score=all_score,
                     threshold=all_threshold,
                     active_flag_name="all_anomaly_active",
@@ -748,7 +840,7 @@ def main():
                     normal_hits_needed=ALL_CLEAR_CONSECUTIVE_NORMALS,
                 )
 
-                _, top_status, top_changed = update_status(
+                top_is_anomaly_now, top_status, top_changed = update_status(
                     score=top_score,
                     threshold=top_threshold,
                     active_flag_name="top_anomaly_active",
@@ -758,6 +850,37 @@ def main():
                     anomaly_hits_needed=TOP_ANOMALY_CONSECUTIVE_HITS,
                     normal_hits_needed=TOP_CLEAR_CONSECUTIVE_NORMALS,
                 )
+
+                sample_id = build_sample_id(key, row)
+                anomaly_id = build_anomaly_id(sample_id)
+                is_anomaly_sample = bool(all_is_anomaly_now or top_is_anomaly_now)
+                is_anomaly_phase = bool(state["all_anomaly_active"] or state["top_anomaly_active"])
+
+                # Baseline history for dynamic thresholds should stay anomaly-free.
+                if is_anomaly_sample:
+                    state["ignored_threshold_ids"].add(sample_id)
+                    if anomaly_id not in state["logged_anomaly_ids"]:
+                        append_identified_anomaly_log({
+                            "anomaly_id": anomaly_id,
+                            "sample_id": sample_id,
+                            "entity_key": f"{key[0]}/{key[1]}/{key[2]}",
+                            "timestamp": str(row.get("timestamp", "")),
+                            "all_score": float(all_score),
+                            "all_threshold": float(all_threshold),
+                            "top_score": float(top_score),
+                            "top_threshold": float(top_threshold),
+                            "all_status": all_status,
+                            "top_status": top_status,
+                            "ignored_for_threshold": True,
+                        })
+                        state["logged_anomaly_ids"].add(anomaly_id)
+                        LOGGER.info(
+                            "ANOMALY_IDENTIFIED | id=%s | sample_id=%s | ignored_for_threshold=true",
+                            anomaly_id, sample_id,
+                        )
+                elif not is_anomaly_phase:
+                    state["all_score_history"].append(all_score)
+                    state["top_score_history"].append(top_score)
 
                 if all_changed == "STARTED" or top_changed == "STARTED":
                     all_status = "ANOMALY_STARTED" if all_changed == "STARTED" else all_status
@@ -786,6 +909,8 @@ def main():
                         f"{k}={v:.6f}"
                         for k, v in ranked[:len(top_features)]
                     )
+                    all_feat_errors = format_all_feature_errors(ranked)
+                    prom_values_text = format_prometheus_actual_values(row)
                     triggered_by = []
                     if all_changed == "STARTED":
                         triggered_by.append("ALL")
@@ -794,6 +919,8 @@ def main():
 
                     alert_message = (
                         f"\U0001F6A8 ANOMALY DETECTED\n\n"
+                        f"Anomaly ID  : {anomaly_id}\n"
+                        f"Sample ID   : {sample_id}\n"
                         f"Entity      : {entity_key}\n"
                         f"Container   : {container}\n"
                         f"Triggered by: {', '.join(triggered_by)} score\n\n"
@@ -801,6 +928,9 @@ def main():
                         f"Top Score   : {top_score:.6f}  (thr {top_threshold:.6f})\n\n"
                         f"Top features: {', '.join(top_features)}\n"
                         f"Feature MSE : {top_feat_errors}\n\n"
+                        f"All MSE     : {all_feat_errors}\n\n"
+                        f"Prometheus logs (actual):\n{prom_values_text}\n\n"
+                        f"Threshold baseline: anomaly IDs ignored ({len(state['ignored_threshold_ids'])})\n\n"
                         f"Reason      : {reason}\n"
                         f"GPT Insight : {gpt_insight}"
                     )
