@@ -52,7 +52,7 @@ def count_csv_rows_in_tar_gz(
     tar_path: str,
     csv_member_name: str,
     *,
-    read_buffer_bytes: int = 1 << 20,  # 1 MB — optimal block size for streaming I/O
+    read_buffer_bytes: int = 1 << 20,  # 1 MB works well for streaming reads.
 ) -> int:
     logger.info(
         "[count_csv_rows_in_tar_gz] Streaming '%s' to count rows …",
@@ -77,14 +77,14 @@ def count_csv_rows_in_tar_gz(
             )
 
         newline_count = 0
-        last_byte     = b""  # track whether the file ends with a newline
+        last_byte     = b""  # Used to check if the file ends with a newline.
 
         while True:
             raw = fobj.read(read_buffer_bytes)
             if not raw:
                 break
             newline_count += raw.count(b"\n")
-            last_byte      = raw[-1:]  # remember last byte of this block
+            last_byte      = raw[-1:]  # Keep the last byte from this block.
 
         if last_byte and last_byte != b"\n":
             newline_count += 1
@@ -92,7 +92,7 @@ def count_csv_rows_in_tar_gz(
     data_rows = max(0, newline_count - 1)
 
     elapsed_s   = time.perf_counter() - t0
-    size_mb     = member.size / (1 << 20)   # uncompressed size in MB
+    size_mb     = member.size / (1 << 20)   # Uncompressed size in MB.
     throughput  = size_mb / elapsed_s if elapsed_s > 0 else float("inf")
 
     logger.info(

@@ -1,6 +1,6 @@
 from typing import Dict, Tuple
 
-# Centralised LLM Prompt Template
+# Main prompt template for the LLM.
 PROMPT_TEMPLATE = """\
 You are an Expert Site Reliability Engineer (SRE) and DevOps Architect specialising \
 in Kubernetes containerised microservices. You have deep expertise in PostgreSQL, Redis, \
@@ -54,7 +54,7 @@ SEVERITY: <Critical|High|Warning|Normal> (your assessed severity — may overrid
 Do NOT add any other text, preamble, or explanation outside this format.\
 """
 
-# Demo mode narratives for offline inference
+# Fallback stories used when no live LLM is available.
 DEMO_NARRATIVES: Dict[str, Dict[str, Tuple[str, str]]] = {
     "database": {
         "mem_util_percent": (

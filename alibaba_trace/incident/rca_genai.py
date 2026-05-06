@@ -78,8 +78,8 @@ class GenAIRCAEngine:
 
     def analyze_with_llm(
         self,
-        original_metrics:      np.ndarray,   # (W, F)
-        reconstructed_metrics: np.ndarray,   # (W, F)
+        original_metrics:      np.ndarray,   # Original window: (W, F)
+        reconstructed_metrics: np.ndarray,   # Model output: (W, F)
         mse:                   float,
         context:               ContainerContext,
         rca_result:            Dict,
@@ -97,13 +97,13 @@ class GenAIRCAEngine:
             context, rca_result, recent_logs, threshold_p95, timestamp_utc,
         )
 
-        # Gemini logic removed as requested by user
+        # Gemini support was removed, so only OpenAI or demo mode runs here.
 
         if self.openai_api_key and not self._is_placeholder(self.openai_api_key):
             try:
                 raw, latency = self._call_openai(prompt)
                 
-                # Log response
+                # Save the live LLM response for review.
                 with open("gpt_logs.txt", "a", encoding="utf-8") as lf:
                     lf.write("================= GPT RESPONSE =================\n")
                     lf.write(raw + "\n\n")
@@ -117,7 +117,7 @@ class GenAIRCAEngine:
         logger.info("GenAIRCAEngine: using DEMO_MODE (no live API available).")
         raw     = self._demo_response(mse, context, rca_result, threshold_p95)
         
-        # Log dummy response to file just to be consistent
+        # Save the demo response in the same log file.
         with open("gpt_logs.txt", "a", encoding="utf-8") as lf:
             lf.write("================= DUMMY (MOCK) RESPONSE =================\n")
             lf.write("(API Keys were not found, this is standard offline fallback generation)\n")
@@ -195,7 +195,7 @@ class GenAIRCAEngine:
             recent_logs=recent_logs.strip() or "(no logs available)",
         )
         
-        # Log the generated prompt to a file as requested by the user
+        # Save the prompt for later review.
         with open("gpt_logs.txt", "a", encoding="utf-8") as lf:
             lf.write("================= NEW GPT REQUEST =================\n")
             lf.write(f"TIMESTAMP: {timestamp_utc}\n")
@@ -289,10 +289,10 @@ class GenAIRCAEngine:
     ) -> LLMAnalysis:
         import re
         verdict           = "UNCERTAIN"
-        root_cause        = raw_text   # fallback: entire response as root_cause
+        root_cause        = raw_text   # Use the full response if parsing fails.
         mitigation        = "Investigate with kubectl describe pod and review application logs."
         confidence        = 70
-        verified_severity = ""         # populated from SEVERITY: field if present
+        verified_severity = ""         # Filled from the SEVERITY field when present.
 
         try:
             m = re.search(r"VERDICT\s*:\s*(.+?)(?:\n|ROOT)", raw_text, re.IGNORECASE)

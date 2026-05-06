@@ -109,7 +109,7 @@ class AlibabaTraceDataset(IterableDataset):
                 (1 - train_ratio) * 100,
             )
         else:
-            self._training_row_limit = 0          # unused in this branch
+            self._training_row_limit = 0          # Not used without an exact row count.
             self._use_exact_split    = False
             logger.warning(
                 "AlibabaTraceDataset [split=%s]: total_rows not supplied — "
@@ -130,9 +130,9 @@ class AlibabaTraceDataset(IterableDataset):
         ts_buffer:   List[np.ndarray] = []
         meta_buffer: List[np.ndarray] = []
 
-        chunk_idx  = 0  # Global chunk counter (for worker sharding + split logic)
+        chunk_idx  = 0  # Tracks chunks for worker sharing and split checks.
         processed_chunks = 0
-        row_cursor = 0  # Running total of rows consumed so far (all workers combined)
+        row_cursor = 0  # Total CSV rows seen so far.
 
         _SENTINEL = 1_000_000_000
 
@@ -194,7 +194,7 @@ class AlibabaTraceDataset(IterableDataset):
                 ts_arr = chunk.reindex(
                     columns=self.feature_cols, fill_value=0.0
                 ).values.astype(np.float32)
-                ts_arr = self.scaler.transform(ts_arr)  # Scale to [0, 1]
+                ts_arr = self.scaler.transform(ts_arr)  # Scale values into [0, 1].
 
                 meta_arr = _encode_metadata(chunk, self.meta_cols)
 
@@ -212,22 +212,22 @@ class AlibabaTraceDataset(IterableDataset):
                            else self.window_size)
 
                 while i + min_end <= buf_len:
-                    ts_win   = ts_full[i : i + self.window_size]                                                         # (W, F)
-                    meta_vec = meta_full[i + self.window_size - 1]                                                       # (M,)
+                    ts_win   = ts_full[i : i + self.window_size]                                                         # Window data: (W, F)
+                    meta_vec = meta_full[i + self.window_size - 1]                                                       # Metadata vector: (M,)
 
                     if self.include_next_step:
-                        next_row = ts_full[i + self.window_size]                                                         # (F,)
+                        next_row = ts_full[i + self.window_size]                                                         # Next row: (F,)
                         yield (
-                            torch.from_numpy(ts_win.copy()),                                                     # ts_window (W,F)
-                            torch.from_numpy(meta_vec.copy()),                                                   # meta_vec   (M,)
-                            torch.from_numpy(ts_win.copy()),                                                     # recon tgt  (W,F)
-                            torch.from_numpy(next_row.copy()),                                                   # fore tgt   (F,)
+                            torch.from_numpy(ts_win.copy()),                                                     # Input window.
+                            torch.from_numpy(meta_vec.copy()),                                                   # Metadata input.
+                            torch.from_numpy(ts_win.copy()),                                                     # Reconstruction target.
+                            torch.from_numpy(next_row.copy()),                                                   # Forecast target.
                         )
                     else:
                         yield (
-                            torch.from_numpy(ts_win.copy()),                                                     # ts_window  (W,F)
-                            torch.from_numpy(meta_vec.copy()),                                                   # meta_vec   (M,)
-                            torch.from_numpy(ts_win.copy()),                                                     # target     (W,F)
+                            torch.from_numpy(ts_win.copy()),                                                     # Input window.
+                            torch.from_numpy(meta_vec.copy()),                                                   # Metadata input.
+                            torch.from_numpy(ts_win.copy()),                                                     # Reconstruction target.
                         )
 
                     i += self.stride

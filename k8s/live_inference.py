@@ -4,7 +4,7 @@ import time
 import logging
 import hashlib
 
-# Force real-time log flushing for production live environment
+# Flush logs immediately in the live container.
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 if hasattr(sys.stderr, "reconfigure"):
@@ -18,9 +18,6 @@ import pandas as pd
 import requests
 import torch
 
-# =========================================================
-# PATHS / IMPORTS
-# =========================================================
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 sys.path.append(PROJECT_ROOT)
@@ -32,16 +29,12 @@ import json
 from dotenv import load_dotenv
 load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
 
-
-# ── Notification / AI helpers (imported once at module level) ──────────────
 from alibaba_trace.utils.notifications import send_telegram_alert
 from alibaba_trace.utils.ai_helper import get_gpt_explanation
 
-
-# =========================================================
-# CONFIG
-# =========================================================
-PROM_URL = "http://35.206.92.147:9090/api/v1/query"
+PROM_URL = os.getenv("PROM_URL")
+if not PROM_URL:
+    raise RuntimeError("PROM_URL must be set in .env or the environment.")
 
 MODEL_DIR = os.path.join(PROJECT_ROOT, "alibaba_trace", "outputs")
 MODEL_PATH = os.path.join(MODEL_DIR, "dual_head_model.pt")
@@ -56,31 +49,21 @@ IDENTIFIED_ANOMALY_LOG = os.path.join(CURRENT_DIR, "identified_anomalies.jsonl")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ---------------------------------------------------------
-# TARGET FILTERS
-# None = monitor all
-# ---------------------------------------------------------
 TARGET_NAMESPACE = None
 TARGET_POD = None
 TARGET_CONTAINER = None
 
-# ---------------------------------------------------------
-# LOOP SETTINGS
-# ---------------------------------------------------------
 POLL_INTERVAL_SECONDS = 10
 WINDOW_SIZE_FALLBACK = 24
 
-# Warmup
 WARMUP_WINDOWS = 20
 
-# ALL feature anomaly logic
 ALL_ANOMALY_CONSECUTIVE_HITS = 3
 ALL_CLEAR_CONSECUTIVE_NORMALS = 3
 ALL_SCORE_HISTORY_SIZE = 100
 ALL_DYNAMIC_THRESHOLD_STD_MULTIPLIER = 4.0
 ALL_MIN_THRESHOLD_FACTOR = 1.0
 
-# TOP feature anomaly logic
 TOPK = 3
 TOP_ANOMALY_CONSECUTIVE_HITS = 2
 TOP_CLEAR_CONSECUTIVE_NORMALS = 2
@@ -88,9 +71,6 @@ TOP_SCORE_HISTORY_SIZE = 100
 TOP_DYNAMIC_THRESHOLD_STD_MULTIPLIER = 4.0
 TOP_MIN_THRESHOLD_FACTOR = 1.0
 
-# ---------------------------------------------------------
-# FEATURES
-# ---------------------------------------------------------
 FEATURE_COLS = [
     "cpu_util",
     "mem_util",
@@ -102,9 +82,6 @@ FEATURE_COLS = [
     "mem_cache",
 ]
 
-# =========================================================
-# LOGGING
-# =========================================================
 LOGGER = logging.getLogger("live_realtime_dual")
 LOGGER.setLevel(logging.INFO)
 LOGGER.handlers.clear()
@@ -121,9 +98,6 @@ sh.setLevel(logging.INFO)
 sh.setFormatter(formatter)
 LOGGER.addHandler(sh)
 
-# ---------------------------------------------------------
-# ANSI terminal colors (no external libs)
-# ---------------------------------------------------------
 _GREEN  = "\033[92m"
 _RED    = "\033[91m"
 _YELLOW = "\033[93m"
@@ -158,9 +132,6 @@ def terminal_log(
     sys.stdout.write(line + "\n")
     sys.stdout.flush()
 
-# =========================================================
-# PROMETHEUS QUERIES
-# =========================================================
 QUERIES = {
     "cpu_util": """
         sum by (
@@ -271,11 +242,6 @@ QUERIES = {
         )
     """,
 }
-
-# =========================================================
-# HELPERS
-# =========================================================
-
 
 def query_prometheus(query: str):
     try:
@@ -467,8 +433,8 @@ def compute_anomaly_score(
     df = window_rows.copy()
     df["cpu_util_percent"] = df["cpu_util"]
     df["mem_util_percent"] = df["mem_util"]
-    df["cpu_request"] = df["cpu_util"] # dummy
-    df["mem_request"] = df["mem_util"] # dummy
+    df["cpu_request"] = df["cpu_util"] # Reuse CPU because live metrics do not include requests.
+    df["mem_request"] = df["mem_util"] # Reuse memory because live metrics do not include requests.
     df["net_in"] = df["net_in"]
     df["net_out"] = df["net_out"]
     df["disk_io_percent"] = df.get("disk_read", 0) + df.get("disk_write", 0)
@@ -480,7 +446,6 @@ def compute_anomaly_score(
     x_scaled = (x_raw - min_) / range_
     x_scaled = np.clip(x_scaled, 0.0, 1.0)
 
-    # Encode metadata
     df["container_id"] = df["container"]
     df["machine_id"] = df["pod"]
     c_scaled = _encode_metadata(df, META_COLS)[0:1]
@@ -489,7 +454,7 @@ def compute_anomaly_score(
     c_tensor = torch.as_tensor(c_scaled, dtype=torch.float32, device=DEVICE)
 
     with torch.no_grad():
-        reconstructed, future_pred = model(x_tensor, c_tensor) # DualHead output
+        reconstructed, future_pred = model(x_tensor, c_tensor) # Dual-head model output.
 
     x_pred_scaled = reconstructed.detach().cpu().numpy()[0]
 
@@ -501,10 +466,8 @@ def compute_anomaly_score(
         for feature, score in zip(["cpu_util_percent", "mem_util_percent", "cpu_request", "mem_request", "net_in", "net_out", "disk_io_percent"], mse_per_feature.tolist())
     }
 
-    # all feature score
     all_score = float(np.mean(mse_per_feature))
 
-    # top-k feature score
     ranked = sorted(feature_error_map.items(), key=lambda kv: kv[1], reverse=True)
     top_features = [k for k, _ in ranked[:TOPK]]
     top_feature_scores = [v for _, v in ranked[:TOPK]]
@@ -514,15 +477,26 @@ def compute_anomaly_score(
 
 
 def reason_from_top_features(top_features):
-    if "mem_rss" in top_features or "mem_util" in top_features or "mem_cache" in top_features:
+    if any(feature in top_features for feature in ("mem_util_percent", "mem_request")):
         return "abnormal memory behavior detected"
-    if "cpu_util" in top_features:
+    if any(feature in top_features for feature in ("cpu_util_percent", "cpu_request")):
         return "abnormal CPU behavior detected"
     if "net_in" in top_features or "net_out" in top_features:
         return "abnormal network behavior detected"
-    if "disk_read" in top_features or "disk_write" in top_features:
+    if "disk_io_percent" in top_features:
         return "abnormal disk I/O behavior detected"
     return "abnormal multivariate behavior detected"
+
+
+def reason_for_log(all_status, top_status, anomaly_reason, is_anomaly_sample=False):
+    statuses = {all_status, top_status}
+    if "ANOMALY_STARTED" in statuses or "ANOMALY_ACTIVE" in statuses:
+        return anomaly_reason
+    if is_anomaly_sample:
+        return f"{anomaly_reason}; waiting for consecutive confirmation"
+    if "ANOMALY_CLEARED" in statuses:
+        return "scores returned within dynamic thresholds"
+    return "scores within dynamic thresholds"
 
 
 def init_container_state():
@@ -585,12 +559,11 @@ def format_prometheus_actual_values(row):
         except Exception:
             raw_values[col] = 0.0
 
-    # Keep model-input mapping visible so Telegram shows exactly what model saw.
     model_input_values = {
         "cpu_util_percent": raw_values["cpu_util"],
         "mem_util_percent": raw_values["mem_util"],
-        "cpu_request": raw_values["cpu_util"],   # dummy mapping used in inference
-        "mem_request": raw_values["mem_util"],   # dummy mapping used in inference
+        "cpu_request": raw_values["cpu_util"],   # Same fallback mapping used during inference.
+        "mem_request": raw_values["mem_util"],   # Same fallback mapping used during inference.
         "net_in": raw_values["net_in"],
         "net_out": raw_values["net_out"],
         "disk_io_percent": raw_values["disk_read"] + raw_values["disk_write"],
@@ -671,7 +644,6 @@ def log_dual_status_block(
     ranked,
     row=None,
 ):
-    # Compact terminal line
     cpu = float(row["cpu_util"]) if row is not None else 0.0
     mem = float(row["mem_util"]) if row is not None else 0.0
     net = float(row["net_in"])   if row is not None else 0.0
@@ -682,7 +654,6 @@ def log_dual_status_block(
         all_status, top_status,
     )
 
-    # Structured detail to file log only
     LOGGER.info(
         "DUAL | %s | ALL=%s(%.6f/%.6f) TOP=%s(%.6f/%.6f) feats=%s reason=%s",
         "/".join(key), all_status, all_score, all_threshold,
@@ -691,16 +662,13 @@ def log_dual_status_block(
     )
 
 
-# =========================================================
-# MAIN
-# =========================================================
 def main():
     LOGGER.info("Loading model artifacts...")
 
     try:
         send_telegram_alert(
             "\U0001F680 Live Inference Agent Started!\n\nDual-Head Model loaded. Monitoring active.",
-            skip_dedup=True,   # always send the startup banner
+            skip_dedup=True,
         )
         LOGGER.info("Startup Telegram message sent successfully.")
     except Exception as e:
@@ -856,7 +824,6 @@ def main():
                 is_anomaly_sample = bool(all_is_anomaly_now or top_is_anomaly_now)
                 is_anomaly_phase = bool(state["all_anomaly_active"] or state["top_anomaly_active"])
 
-                # Baseline history for dynamic thresholds should stay anomaly-free.
                 if is_anomaly_sample:
                     state["ignored_threshold_ids"].add(sample_id)
                     if anomaly_id not in state["logged_anomaly_ids"]:
@@ -886,7 +853,6 @@ def main():
                     all_status = "ANOMALY_STARTED" if all_changed == "STARTED" else all_status
                     top_status = "ANOMALY_STARTED" if top_changed == "STARTED" else top_status
 
-                    # Log raw Prometheus snapshot for post-mortem
                     try:
                         with open('prometheus_anomaly_query_data.log', 'a', encoding='utf-8') as f:
                             f.write(str(window_df.iloc[-1].to_dict()) + '\n')
@@ -897,14 +863,12 @@ def main():
                     namespace, pod, container = key
                     entity_key = f"{namespace}/{pod}/{container}"
 
-                    # ── STEP 1: GPT Root Cause Analysis ──────────────────────
                     gpt_insight = get_gpt_explanation(
                         top_features=top_features,
                         reason=reason,
                         scores={"all_score": all_score, "top_score": top_score},
                     )
 
-                    # ── STEP 2: Format alert message ──────────────────────────
                     top_feat_errors = ", ".join(
                         f"{k}={v:.6f}"
                         for k, v in ranked[:len(top_features)]
@@ -935,10 +899,9 @@ def main():
                         f"GPT Insight : {gpt_insight}"
                     )
 
-                    # ── STEP 3: Send Telegram alert ───────────────────────────
                     result = send_telegram_alert(
                         message=alert_message,
-                        entity_key=entity_key,   # used for dedup fingerprint
+                        entity_key=entity_key,
                     )
                     if not result.get("success"):
                         LOGGER.warning(
@@ -962,7 +925,7 @@ def main():
                     top_threshold=top_threshold,
                     top_status=top_status,
                     top_features=top_features,
-                    reason=reason,
+                    reason=reason_for_log(all_status, top_status, reason, is_anomaly_sample),
                     ranked=ranked,
                     row=row,
                 )
@@ -980,7 +943,7 @@ def main():
             break
         except Exception as e:
             LOGGER.exception(f"Loop error: {e}")
-            time.sleep(10) # wait before retrying on general error
+            time.sleep(10)
 
 if __name__ == "__main__":
     main()

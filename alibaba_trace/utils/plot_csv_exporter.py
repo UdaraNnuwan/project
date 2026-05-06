@@ -5,10 +5,10 @@ import matplotlib.figure
 _original_savefig = matplotlib.figure.Figure.savefig
 
 def _save_csv_alongside_png(self, *args, **kwargs):
-    # First save the actual image
+    # Save the PNG first.
     ret = _original_savefig(self, *args, **kwargs)
     
-    # Try to determine the filename
+    # Get the output file name.
     try:
         filename = kwargs.get('fname', args[0] if args else None)
         if filename is None:
@@ -20,10 +20,10 @@ def _save_csv_alongside_png(self, *args, **kwargs):
             
         csv_filename = filename.replace('.png', '.csv')
         
-        # Now extract X and Y coordinates
+        # Export X and Y values from the figure.
         data = {}
         for i, ax in enumerate(self.axes):
-            # Extract basic plot lines
+            # Save line plots.
             for j, line in enumerate(ax.get_lines()):
                 label = line.get_label()
                 if not label or label.startswith('_'):
@@ -31,7 +31,7 @@ def _save_csv_alongside_png(self, *args, **kwargs):
                 data[f"{label}_x"] = line.get_xdata()
                 data[f"{label}_y"] = line.get_ydata()
                 
-            # Extract bar charts
+            # Save bar charts.
             for j, container in enumerate(ax.containers):
                 label = container.get_label()
                 if not label or label.startswith('_'):
@@ -42,7 +42,7 @@ def _save_csv_alongside_png(self, *args, **kwargs):
                 except Exception:
                     pass
                     
-            # Extract PolyCollections (e.g. fill_between)
+            # Save shaded areas, such as fill_between.
             for j, coll in enumerate(ax.collections):
                 label = coll.get_label()
                 if not label or label.startswith('_'):

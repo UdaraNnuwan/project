@@ -21,24 +21,22 @@ spec:
     spec:
       containers:
       - name: bilstm-inference-pod
-        # Replace this with your actual built image (e.g. gcr.io/my-project/bilstm-inference:v1)
+        # Replace this with your built image, for example gcr.io/my-project/bilstm-inference:v1.
         image: <YOUR_DOCKER_REGISTRY_URL>/bilstm-film-inference:latest 
         imagePullPolicy: Always
         
-        # Explicit overriding of environment variables
+        # Environment values used by the live inference container.
         env:
         - name: PROM_URL
           value: "http://35.206.92.147:9090/api/v1/query"
           
-        # Resource allocations for lightweight ML workloads
+        # Resource settings for a small ML workload.
         resources:
           requests:
-            cpu: "250m"       # Guaranteed 0.25 vCPU cores
-            memory: "512Mi"   # Guaranteed 512 Megabytes Memory
+            cpu: "250m"       # Guaranteed 0.25 vCPU cores.
+            memory: "512Mi"   # Guaranteed 512 MiB memory.
           limits:
-            cpu: "1000m"      # Maximum 1 vCPU
-            memory: "1.5Gi"   # Maximum 1.5 Gigabytes Memory
+            cpu: "1000m"      # Maximum 1 vCPU.
+            memory: "1.5Gi"   # Maximum 1.5 GiB memory.
             
-        # Keep Kubernetes aware of container health (assuming your app stays up as long as Python runs)
-        # We can simulate liveness since it's an infinite loop process with no HTTP server
-        # Alternately you can add a health endpoint / file touch later.
+        # Add a liveness check here if you add a health endpoint later.

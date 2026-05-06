@@ -105,12 +105,12 @@ CONTAINER_PROFILES: Dict[str, Dict] = {
 class ContainerContext:
     container_id:     str
     machine_id:       str
-    container_type:   str   # Key into CONTAINER_PROFILES
+    container_type:   str   # Must match a key in CONTAINER_PROFILES.
     tier:             str
     environment:      str
     namespace:        str
     pod_name:         str
-    film_meta_vector: np.ndarray  # Shape (M,)
+    film_meta_vector: np.ndarray  # Metadata vector used by FiLM.
 
     def profile(self) -> Dict:
         return CONTAINER_PROFILES.get(self.container_type, _GENERIC_PROFILE)
@@ -241,19 +241,19 @@ class LLMAnalysis:
 class IncidentEvent:
     event_id:           str
     timestamp_utc:      str
-    context:            ContainerContext   # Full FiLM metadata
+    context:            ContainerContext   # Full container metadata for FiLM.
     severity:           str
     mse_score:          float
-    primary_metric:     str               # FEATURE_COLS column name
-    primary_display:    str               # Human-readable name
-    anomaly_name:       str               # Profile-specific label
-    diagnosis:          str               # Context-aware explanation
-    recommended_action: str               # Step-by-step remediation
-    escalation_path:    str               # Who to page
-    icon:               str               # Feature icon emoji
+    primary_metric:     str               # Metric column that caused the alert.
+    primary_display:    str               # Clear metric name for users.
+    anomaly_name:       str               # Alert name for this profile.
+    diagnosis:          str               # Explanation based on context.
+    recommended_action: str               # Action the operator should take.
+    escalation_path:    str               # Team or person to contact.
+    icon:               str               # Icon shown with the feature.
     runbook_url:        str
-    feature_errors:     Dict[str, float]  # {feature: per-feature MSE}
-    alert_payload:      str               # Pre-rendered JSON string
+    feature_errors:     Dict[str, float]  # MSE score for each feature.
+    alert_payload:      str               # Alert JSON that is ready to send.
 
     def to_alert_dict(self) -> Dict:
         return json.loads(self.alert_payload)

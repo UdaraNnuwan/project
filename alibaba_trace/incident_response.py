@@ -1,7 +1,7 @@
 import sys
 import os
 
-# Prevent ModuleNotFoundError when Jupyter is run with --notebook-dir=alibaba_trace
+# Keep imports working when Jupyter starts inside alibaba_trace.
 _current_dir = os.path.dirname(os.path.abspath(__file__))
 _project_root = os.path.dirname(_current_dir)
 if _project_root not in sys.path:

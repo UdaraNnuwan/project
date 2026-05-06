@@ -10,7 +10,7 @@ from alibaba_trace.data_pipeline import (
 from alibaba_trace.model import BiLSTMFiLMAutoencoder
 
 def run_inference_and_log():
-    # 1. Setup Configuration 
+    # Set up paths and data options.
     raw_dir = Path("../data").resolve() 
     if not (raw_dir / "container_usage.tar.gz").exists():
         raw_dir = Path("dataset/data").resolve() 
@@ -20,7 +20,7 @@ def run_inference_and_log():
         chunksize=50000,
         batch_size=128,
         window_size=30,
-        container_limit=50 # Using 50 containers for the demo
+        container_limit=50 # Keep the demo small by using 50 containers.
     )
 
     print("Phase 1: Preparing Vocabularies and Scalers...")
@@ -40,14 +40,14 @@ def run_inference_and_log():
         num_layers=1
     ).to(device)
     
-    # Normally you would load your trained weights here:
+    # Load trained weights here when they are available.
     # model.load_state_dict(torch.load("model_weights.pth"))
     model.eval()
 
     print("Phase 2: Initiating Test Inference Stream...")
     test_loader = build_streaming_dataloader(
         config=config,
-        split="test",  # We run inference on the TEST split
+        split="test",  # Run inference on the test split.
         plan=split_plan,
         vocab=vocabulary,
         x_scaler=x_scaler,
@@ -56,8 +56,8 @@ def run_inference_and_log():
         device=device
     )
 
-    # We will use a dummy threshold for demonstration. 
-    # In practice, you calculate this on your validation set.
+    # Demo threshold only.
+    # For real use, calculate this from the validation set.
     ANOMALY_THRESHOLD = 0.5 
 
     anomaly_log = []
@@ -66,17 +66,17 @@ def run_inference_and_log():
     with torch.no_grad():
         for batch_idx, (x_batch, c_batch) in enumerate(test_loader):
             
-            # Reconstruct the window
+            # Rebuild the window with the model.
             reconstructed = model(x_batch, c_batch)
             
-            # Calculate MSE per window (batch_size, sequence_length, features)
-            # We average the error over the sequence and features
+            # Calculate one MSE score for each window.
+            # Average the error across time steps and features.
             mse_per_window = torch.mean((reconstructed - x_batch) ** 2, dim=(1, 2))
             
             mse_scores = mse_per_window.cpu().numpy()
             
             for idx, score in enumerate(mse_scores):
-                # Is it normal or not?
+                # Label the window from its MSE score.
                 status = "Anomaly" if score > ANOMALY_THRESHOLD else "Normal"
                 
                 anomaly_log.append({
@@ -84,10 +84,10 @@ def run_inference_and_log():
                     "window_index": idx,
                     "mse_score": round(float(score), 4),
                     "threshold": ANOMALY_THRESHOLD,
-                    "status": status  # This logs "Normal" or "Anomaly" (normalda nadda)
+                    "status": status  # Output label for this window.
                 })
 
-    # Save the log to a file
+    # Save the results to a CSV file.
     output_df = pd.DataFrame(anomaly_log)
     output_path = Path("anomaly_predictions_log.csv")
     output_df.to_csv(output_path, index=False)
@@ -95,7 +95,7 @@ def run_inference_and_log():
     print(f"\\n Inference complete! Logged {len(output_df)} windows.")
     print(f" Results saved to: {output_path.resolve()}")
     
-    # Preview top 10 results
+    # Show the first 10 results.
     print("\\nPreview of Log:")
     print(output_df.head(10).to_string(index=False))
 

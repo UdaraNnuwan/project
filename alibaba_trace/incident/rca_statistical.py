@@ -97,7 +97,7 @@ class ContextAwareRCA:
                 f"reconstructed={reconstructed.shape}"
             )
 
-        raw_errors      = np.mean((original - reconstructed) ** 2, axis=0)  # (F,)
+        raw_errors      = np.mean((original - reconstructed) ** 2, axis=0)  # One score per feature.
         weighted_errors = raw_errors * self._weights
 
         total_mse = float(raw_errors.sum()) or 1e-12

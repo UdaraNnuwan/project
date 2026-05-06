@@ -7,7 +7,7 @@ import torch.nn as nn
 logger = logging.getLogger("model_architecture")
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  [%(levelname)s]  %(name)s – %(message)s",
+    format="%(asctime)s  [%(levelname)s]  %(name)s - %(message)s",
 )
 class FiLMLayer(nn.Module):
     def __init__(
@@ -292,7 +292,7 @@ def load_model(
     state = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state)
     model.eval()
-    logger.info("Loaded single-head weights from '%s' → device=%s", checkpoint_path, device)
+    logger.info("Loaded single-head weights from '%s' -> device=%s", checkpoint_path, device)
     return model
 def build_dual_head_model(
     window_size:     int,
@@ -349,7 +349,7 @@ def load_dual_head_model(
     state = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state)
     model.eval()
-    logger.info("Loaded dual-head weights from '%s' → device=%s", checkpoint_path, device)
+    logger.info("Loaded dual-head weights from '%s' -> device=%s", checkpoint_path, device)
     return model
 if __name__ == "__main__":
     WINDOW, TS_F, META_F, BATCH = 50, 7, 2, 4

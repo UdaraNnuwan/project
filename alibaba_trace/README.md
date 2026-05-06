@@ -44,8 +44,8 @@ This prints all member names inside the `.tar.gz` so you can set `CSV_MEMBER` co
 ### 3 · Edit the configuration block
 In both notebooks, edit the `# CONFIGURATION` cell:
 ```python
-TAR_PATH   = r'C:\path\to\container_usage.tar.gz'   # ← your actual path
-CSV_MEMBER = 'container_usage/container_usage.csv'   # ← from discover step
+TAR_PATH   = r'C:\path\to\container_usage.tar.gz'   # Path to your archive
+CSV_MEMBER = 'container_usage/container_usage.csv'   # Value from the discover step
 ```
 
 ### 4 · Run the notebooks in order

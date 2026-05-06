@@ -394,7 +394,7 @@ class AlertGenerator:
 
             resp = _requests_lib.post(
                 api_url, json=payload,
-                timeout=10,        # max 10 s — never block the pipeline
+                timeout=10,        # Do not let Telegram block the pipeline for long.
             )
 
             result["status_code"] = resp.status_code
@@ -422,7 +422,7 @@ class AlertGenerator:
             )
             logger.error("Telegram send failed: %s", result["error"])
 
-        except Exception as exc:          # ConnectionError, Timeout, etc.
+        except Exception as exc:          # Network errors, timeouts, and other send failures.
             result["error"] = f"{type(exc).__name__}: {exc}"
             logger.warning(
                 "Telegram send failed (non-fatal) — %s", result["error"]

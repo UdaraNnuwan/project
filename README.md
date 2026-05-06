@@ -31,17 +31,17 @@ Loss = α·MSE_recon + (1-α)·MSE_forecast   (α = 0.5)
 ```
 project/
 ├── alibaba_trace/
-│   ├── model_architecture.py      # BiLSTM-FiLM dual-head model (PyTorch)
-│   ├── data_pipeline.py           # Streaming dataset from .tar.gz archive
-│   ├── incident_response.py       # Alerting engine (Prometheus + Telegram + GenAI RCA)
-│   ├── 01_Model_Training.ipynb    # Train the dual-head model
-│   ├── 02_Evaluation_and_Thesis_Graphs.ipynb  # 300 DPI thesis figures
-│   ├── 03_Alerting_and_RCA_Prototype.ipynb    # Prometheus + Telegram alerts
-│   ├── 04_Data_Injection_and_Accuracy_Testing.ipynb  # FiLM context validation
-│   ├── 05_GenAI_RCA_Integration.ipynb         # Gemini/GPT-4 root cause analysis
+│   ├── model_architecture.py      # PyTorch model code
+│   ├── data_pipeline.py           # Streams data from the .tar.gz archive
+│   ├── incident_response.py       # Sends Prometheus, Telegram, and GenAI alerts
+│   ├── 01_Model_Training.ipynb    # Trains the dual-head model
+│   ├── 02_Evaluation_and_Thesis_Graphs.ipynb  # Makes thesis figures at 300 DPI
+│   ├── 03_Alerting_and_RCA_Prototype.ipynb    # Tests Prometheus and Telegram alerts
+│   ├── 04_Data_Injection_and_Accuracy_Testing.ipynb  # Tests FiLM context behavior
+│   ├── 05_GenAI_RCA_Integration.ipynb         # Adds GenAI root cause analysis
 │   ├── requirements.txt
-│   └── outputs/                   # Saved model checkpoints + figures (git-ignored)
-├── .env                           # API keys (git-ignored)
+│   └── outputs/                   # Saved models and figures, ignored by git
+├── .env                           # API keys, ignored by git
 └── .gitignore
 ```
 
